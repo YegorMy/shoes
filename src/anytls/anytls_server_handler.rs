@@ -109,7 +109,10 @@ impl TcpServerHandler for AnyTlsServerHandler {
             // The embedder decides; the configured users are not consulted.
             let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
             let password_sha256: &[u8; 32] = auth_data.try_into().unwrap();
-            let Some(grant) = hooks.open_session(SessionAuth::AnyTls { password_sha256 }) else {
+            let Some(grant) = hooks.open_session(SessionAuth::AnyTls {
+                password_sha256,
+                target: self.proxy_provider.target(),
+            }) else {
                 log::debug!("AnyTLS authentication refused by embedder hooks");
                 if let Some(ref fallback) = self.fallback {
                     return self.fallback_to_dest(server_stream, reader, fallback).await;

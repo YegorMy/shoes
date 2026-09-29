@@ -40,9 +40,12 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 struct TestHooks {
     users: Mutex<HashMap<[u8; 32], (String, CancellationToken)>>,
     listener_session: Mutex<Option<CancellationToken>>,
+    /// Listener sessions granted per server target (SNI).
+    target_sessions: Mutex<HashMap<String, CancellationToken>>,
     outbound: Mutex<HashMap<u16, OutboundDecision>>,
     refused: AtomicUsize,
     checked: Mutex<Vec<SocketAddr>>,
+    targets_seen: Mutex<Vec<Option<String>>>,
 }
 
 impl TestHooks {
@@ -58,16 +61,30 @@ impl TestHooks {
 impl ServerHooks for TestHooks {
     fn open_session(&self, auth: SessionAuth<'_>) -> Option<SessionGrant> {
         let grant = match auth {
-            SessionAuth::AnyTls { password_sha256 } => self
+            SessionAuth::AnyTls {
+                password_sha256, ..
+            } => self
                 .users
                 .lock()
                 .get(password_sha256)
                 .map(|(name, cancel)| SessionGrant::new(name.clone(), cancel.clone())),
-            SessionAuth::Listener => self
-                .listener_session
-                .lock()
-                .clone()
-                .map(|cancel| SessionGrant::new("listener", cancel)),
+            SessionAuth::Listener { target: None } => {
+                self.targets_seen.lock().push(None);
+                self.listener_session
+                    .lock()
+                    .clone()
+                    .map(|cancel| SessionGrant::new("listener", cancel))
+            }
+            SessionAuth::Listener {
+                target: Some(target),
+            } => {
+                self.targets_seen.lock().push(Some(target.to_string()));
+                self.target_sessions
+                    .lock()
+                    .get(target)
+                    .cloned()
+                    .map(|cancel| SessionGrant::new(target, cancel))
+            }
             _ => None,
         };
         if grant.is_none() {
@@ -396,6 +413,97 @@ protocol:
     cancel.cancel();
     assert!(wait_closed(&mut stream).await, "cancelled session must end");
     assert!(echo.wait_all_closed().await);
+
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_listener_sessions_report_their_tls_target() -> TestResult {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut ports = PortHelper::new();
+    let echo = EchoServer::start().await?;
+    let echo_addr = echo.addr;
+
+    let (cert, key) = generate_test_cert_files()?;
+    let (cert, key) = (cert.to_str().unwrap(), key.to_str().unwrap());
+    let (ip, port) = ports.get_localhost_listener_port();
+    let hooks = Arc::new(TestHooks::default());
+    let device_a = CancellationToken::new();
+    hooks
+        .target_sessions
+        .lock()
+        .insert("a.hooks.test".to_string(), device_a.clone());
+    // One listener, one TLS target per device, each with its own inner key.
+    let server_yaml = format!(
+        r#"
+- address: "{ip}:{port}"
+  protocol:
+    type: tls
+    tls_targets:
+      "a.hooks.test":
+        cert: "{cert}"
+        key: "{key}"
+        protocol:
+          type: shadowsocks
+          cipher: aes-256-gcm
+          password: "device-a-key"
+      "b.hooks.test":
+        cert: "{cert}"
+        key: "{key}"
+        protocol:
+          type: shadowsocks
+          cipher: aes-256-gcm
+          password: "device-b-key"
+"#
+    );
+    let handles = start_hooked_servers(&server_yaml, &resolver, hooks.clone()).await?;
+    ports.wait_for_all_ports().await?;
+    let client = |sni: &str, key: &str| -> Result<ClientConfig, serde_yaml::Error> {
+        serde_yaml::from_str(&format!(
+            r#"
+address: "{ip}:{port}"
+protocol:
+  type: tls
+  verify: false
+  sni_hostname: "{sni}"
+  protocol:
+    type: shadowsocks
+    cipher: aes-256-gcm
+    password: "{key}"
+"#
+        ))
+    };
+
+    // Device B's target has no grant: refused before any outbound connection.
+    if let Ok(mut refused) = connect(
+        client("b.hooks.test", "device-b-key")?,
+        echo_addr,
+        &resolver,
+    )
+    .await
+    {
+        assert_no_echo(&mut refused).await;
+    }
+    assert_eq!(echo.accepted(), 0);
+
+    // Device A's target is granted, and cancelling its grant ends the session.
+    let mut stream = connect(
+        client("a.hooks.test", "device-a-key")?,
+        echo_addr,
+        &resolver,
+    )
+    .await?;
+    assert_echo(&mut stream, b"hello from the device a target").await;
+    device_a.cancel();
+    assert!(wait_closed(&mut stream).await, "cancelled session must end");
+    assert!(echo.wait_all_closed().await);
+
+    let seen = hooks.targets_seen.lock().clone();
+    assert!(seen.contains(&Some("a.hooks.test".to_string())));
+    assert!(seen.contains(&Some("b.hooks.test".to_string())));
 
     for handle in handles {
         handle.abort();

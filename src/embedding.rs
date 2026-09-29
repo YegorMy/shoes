@@ -56,15 +56,22 @@ pub trait ServerHooks: Send + Sync + Debug {
 }
 
 /// The credentials a client presented when opening a session.
+///
+/// `target` names the server target the session arrived on when the listener
+/// has several (the SNI of a TLS, ShadowTLS or REALITY target), so targets
+/// configured per user can be told apart.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SessionAuth<'a> {
     /// An AnyTLS client, identified by the SHA-256 hash of its password.
-    AnyTls { password_sha256: &'a [u8; 32] },
-    /// A client of a protocol that authenticates with the listener's own
-    /// credential (for example a Shadowsocks key) and carries no per-user
-    /// identity.
-    Listener,
+    AnyTls {
+        password_sha256: &'a [u8; 32],
+        target: Option<&'a str>,
+    },
+    /// A client of a protocol that authenticates with the listener's or the
+    /// target's own credential (for example a Shadowsocks key) and carries no
+    /// per-user identity.
+    Listener { target: Option<&'a str> },
 }
 
 /// An accepted session.

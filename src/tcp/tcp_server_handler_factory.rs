@@ -164,9 +164,10 @@ pub fn create_tcp_server_handler(
             let mut all_targets = tls_targets
                 .into_iter()
                 .map(|(sni, config)| {
+                    let selector = client_proxy_selector.for_target(&sni);
                     (
                         sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
+                        create_tls_server_target(config, &selector, resolver, bind_ip),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
@@ -176,14 +177,10 @@ pub fn create_tcp_server_handler(
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| {
+                    let selector = client_proxy_selector.for_target(&sni);
                     (
                         sni,
-                        create_shadow_tls_server_target(
-                            config,
-                            client_proxy_selector,
-                            resolver,
-                            bind_ip,
-                        ),
+                        create_shadow_tls_server_target(config, &selector, resolver, bind_ip),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
@@ -191,14 +188,10 @@ pub fn create_tcp_server_handler(
             let reality_server_targets = reality_targets
                 .into_iter()
                 .map(|(sni, config)| {
+                    let selector = client_proxy_selector.for_target(&sni);
                     (
                         sni,
-                        create_reality_server_target(
-                            config,
-                            client_proxy_selector,
-                            resolver,
-                            bind_ip,
-                        ),
+                        create_reality_server_target(config, &selector, resolver, bind_ip),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();

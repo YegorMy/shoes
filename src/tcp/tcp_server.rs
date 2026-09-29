@@ -151,17 +151,19 @@ where
 
     // Protocols without a per-user identity report their sessions here;
     // handlers that authenticate users themselves return AlreadyHandled.
-    let hooks = setup_result
-        .proxy_selector()
-        .and_then(|selector| selector.hooks().cloned());
-    let grant = match hooks {
-        Some(hooks) => match hooks.open_session(SessionAuth::Listener) {
-            Some(grant) => Some(grant),
-            None => {
-                debug!("session refused by embedder hooks");
-                return Ok(());
-            }
-        },
+    let session = setup_result.proxy_selector().and_then(|selector| {
+        selector.hooks().map(|hooks| {
+            hooks.open_session(SessionAuth::Listener {
+                target: selector.target(),
+            })
+        })
+    });
+    let grant = match session {
+        Some(Some(grant)) => Some(grant),
+        Some(None) => {
+            debug!("session refused by embedder hooks");
+            return Ok(());
+        }
         None => None,
     };
 

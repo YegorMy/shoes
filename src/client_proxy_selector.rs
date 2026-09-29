@@ -190,6 +190,16 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 // TODO: Replace linear rule matching with radix set/trie
 #[derive(Debug)]
 pub struct ClientProxySelector {
+    /// Shared by the per-target selectors derived with [`Self::for_target`].
+    rule_set: Arc<RuleSet>,
+    /// Embedder hooks consulted after the rules allow a destination.
+    hooks: Option<Arc<dyn ServerHooks>>,
+    /// The server target (e.g. TLS SNI) whose sessions this selector routes.
+    target: Option<Arc<str>>,
+}
+
+#[derive(Debug)]
+struct RuleSet {
     rules: Vec<ConnectRule>,
     /// If false, hostname rules will not trigger DNS resolution to match against IP-based
     /// destinations. This is useful when a huge blocklist or rule list is provided.
@@ -199,8 +209,6 @@ pub struct ClientProxySelector {
     /// LRU cache for routing decisions. Speeds up repeated lookups for the same destination.
     /// None if caching is disabled (few rules and no DNS resolution).
     cache: Option<RoutingCache>,
-    /// Embedder hooks consulted after the rules allow a destination.
-    hooks: Option<Arc<dyn ServerHooks>>,
 }
 
 unsafe impl Send for ClientProxySelector {}
@@ -266,10 +274,13 @@ impl ClientProxySelector {
         };
 
         Self {
-            rules,
-            resolve_rule_hostnames,
-            cache,
+            rule_set: Arc::new(RuleSet {
+                rules,
+                resolve_rule_hostnames,
+                cache,
+            }),
             hooks: None,
+            target: None,
         }
     }
 
@@ -280,10 +291,30 @@ impl ClientProxySelector {
         self
     }
 
-    /// Carry over `parent`'s hooks, for selectors built from override rules.
+    /// Carry over `parent`'s hooks and target, for selectors built from
+    /// override rules.
     pub fn with_hooks_of(mut self, parent: &ClientProxySelector) -> Self {
         self.hooks = parent.hooks.clone();
+        self.target = parent.target.clone();
         self
+    }
+
+    /// The selector for sessions of one server target (e.g. a TLS SNI), so
+    /// embedder hooks can tell targets apart. Without hooks the selector is
+    /// returned unchanged.
+    pub fn for_target(self: &Arc<Self>, target: &str) -> Arc<Self> {
+        if self.hooks.is_none() {
+            return Arc::clone(self);
+        }
+        Arc::new(Self {
+            rule_set: Arc::clone(&self.rule_set),
+            hooks: self.hooks.clone(),
+            target: Some(target.into()),
+        })
+    }
+
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     pub fn hooks(&self) -> Option<&Arc<dyn ServerHooks>> {
@@ -343,7 +374,7 @@ impl ClientProxySelector {
         let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
 
         // If caching is disabled, go directly to rule matching
-        let cache = match &self.cache {
+        let cache = match &self.rule_set.cache {
             Some(c) => c,
             None => {
                 return self.judge_uncached(location, resolved_ip, resolver).await;
@@ -359,18 +390,18 @@ impl ClientProxySelector {
         // Slow path: full rule matching (may resolve and update the location)
         let mut location = location;
         match match_rule(
-            &self.rules,
+            &self.rule_set.rules,
             &mut location,
             resolved_ip,
             resolver,
-            self.resolve_rule_hostnames,
+            self.rule_set.resolve_rule_hostnames,
         )
         .await?
         {
             Some(rule_index) => {
                 // Cache the result
                 cache.insert(location.location(), CachedDecision::Allow(rule_index));
-                Ok(self.rules[rule_index].action.to_decision(location))
+                Ok(self.rule_set.rules[rule_index].action.to_decision(location))
             }
             None => {
                 // Cache the block decision
@@ -390,15 +421,15 @@ impl ClientProxySelector {
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
         match match_rule(
-            &self.rules,
+            &self.rule_set.rules,
             &mut location,
             resolved_ip,
             resolver,
-            self.resolve_rule_hostnames,
+            self.rule_set.resolve_rule_hostnames,
         )
         .await?
         {
-            Some(rule_index) => Ok(self.rules[rule_index].action.to_decision(location)),
+            Some(rule_index) => Ok(self.rule_set.rules[rule_index].action.to_decision(location)),
             None => Ok(ConnectDecision::Block),
         }
     }
@@ -412,7 +443,7 @@ impl ClientProxySelector {
     ) -> ConnectDecision<'_> {
         match cached {
             CachedDecision::Allow(rule_index) => {
-                self.rules[rule_index].action.to_decision(location)
+                self.rule_set.rules[rule_index].action.to_decision(location)
             }
             CachedDecision::Block => ConnectDecision::Block,
         }
@@ -420,19 +451,19 @@ impl ClientProxySelector {
 
     #[cfg(test)]
     fn cache_size(&self) -> usize {
-        self.cache.as_ref().map_or(0, |c| c.len())
+        self.rule_set.cache.as_ref().map_or(0, |c| c.len())
     }
 
     #[cfg(test)]
     fn clear_cache(&self) {
-        if let Some(cache) = &self.cache {
+        if let Some(cache) = &self.rule_set.cache {
             cache.clear();
         }
     }
 
     #[cfg(test)]
     fn is_cache_enabled(&self) -> bool {
-        self.cache.is_some()
+        self.rule_set.cache.is_some()
     }
 }
 
