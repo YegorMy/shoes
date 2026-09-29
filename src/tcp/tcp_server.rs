@@ -19,6 +19,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
+use crate::embedding::{ServerHooks, SessionAuth};
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -148,6 +149,36 @@ where
         }
     };
 
+    // Protocols without a per-user identity report their sessions here;
+    // handlers that authenticate users themselves return AlreadyHandled.
+    let hooks = setup_result
+        .proxy_selector()
+        .and_then(|selector| selector.hooks().cloned());
+    let grant = match hooks {
+        Some(hooks) => match hooks.open_session(SessionAuth::Listener) {
+            Some(grant) => Some(grant),
+            None => {
+                debug!("session refused by embedder hooks");
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
+    let forward = forward_setup_result(setup_result, resolver);
+    match grant {
+        Some(grant) => tokio::select! {
+            result = forward => result,
+            () = grant.cancel_token().cancelled() => Ok(()),
+        },
+        None => forward.await,
+    }
+}
+
+async fn forward_setup_result(
+    setup_result: TcpServerSetupResult,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -348,7 +379,16 @@ pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
+    start_servers_with(config, resolver, None).await
+}
+
+pub(crate) async fn start_servers_with(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    hooks: Option<Arc<dyn ServerHooks>>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
+        Config::TunServer(_) if hooks.is_some() => Err(hooks_unsupported("TUN")),
         #[cfg(unix)]
         Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
             .await
@@ -358,19 +398,33 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver, hooks).await
+        }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
+}
+
+fn hooks_unsupported(kind: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("server hooks are not supported for {kind} servers"),
+    )
 }
 
 async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    hooks: Option<Arc<dyn ServerHooks>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = Vec::with_capacity(3);
 
+    if hooks.is_some() && !matches!(config.transport, Transport::Tcp) {
+        return Err(hooks_unsupported("QUIC"));
+    }
+
     match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
+        Transport::Tcp => match start_tcp_servers(config.clone(), resolver, hooks).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -408,6 +462,7 @@ async fn start_tcp_or_quic_servers(
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    hooks: Option<Arc<dyn ServerHooks>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -425,10 +480,12 @@ async fn start_tcp_servers(
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
-        rules.clone(),
-        resolver.clone(),
-    ));
+    let mut client_proxy_selector =
+        create_tcp_client_proxy_selector(rules.clone(), resolver.clone());
+    if let Some(hooks) = hooks {
+        client_proxy_selector = client_proxy_selector.with_hooks(hooks);
+    }
+    let client_proxy_selector = Arc::new(client_proxy_selector);
 
     let mut handles = vec![];
 

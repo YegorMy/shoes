@@ -18,6 +18,7 @@ use crate::anytls::anytls_server_session::AnyTlsSession;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::embedding::{SessionAuth, SessionGrant};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -104,6 +105,31 @@ impl TcpServerHandler for AnyTlsServerHandler {
         // Use StreamReader to peek at auth header without consuming
         let mut reader = StreamReader::new();
 
+        if let Some(hooks) = self.proxy_provider.hooks() {
+            // The embedder decides; the configured users are not consulted.
+            let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
+            let password_sha256: &[u8; 32] = auth_data.try_into().unwrap();
+            let Some(grant) = hooks.open_session(SessionAuth::AnyTls { password_sha256 }) else {
+                log::debug!("AnyTLS authentication refused by embedder hooks");
+                if let Some(ref fallback) = self.fallback {
+                    return self.fallback_to_dest(server_stream, reader, fallback).await;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "authentication failed",
+                ));
+            };
+            reader.consume(32);
+            return self
+                .start_session(
+                    server_stream,
+                    reader,
+                    grant.identity().to_string(),
+                    Some(grant),
+                )
+                .await;
+        }
+
         // First, peek at the 8-byte prefix for quick fallback.
         // This allows us to reject non-AnyTLS traffic (e.g., small HTTP requests)
         // without hanging waiting for the full 32-byte hash.
@@ -148,6 +174,20 @@ impl TcpServerHandler for AnyTlsServerHandler {
             }
         };
 
+        self.start_session(server_stream, reader, user_name, None)
+            .await
+    }
+}
+
+impl AnyTlsServerHandler {
+    /// Read the rest of the auth header and run the session in a background task.
+    async fn start_session(
+        &self,
+        mut server_stream: Box<dyn AsyncStream>,
+        mut reader: StreamReader,
+        user_name: String,
+        grant: Option<SessionGrant>,
+    ) -> std::io::Result<TcpServerSetupResult> {
         let padding_len = reader.read_u16_be(&mut server_stream).await?;
 
         // Skip padding bytes (consume them from the reader)
@@ -173,16 +213,22 @@ impl TcpServerHandler for AnyTlsServerHandler {
 
         // Run the session in a background task
         tokio::spawn(async move {
-            if let Err(e) = session.run().await {
+            let result = match grant {
+                Some(grant) => {
+                    session
+                        .run_until_cancelled(Some(grant.cancel_token().clone()))
+                        .await
+                }
+                None => session.run().await,
+            };
+            if let Err(e) = result {
                 log::debug!("AnyTLS session ended: {}", e);
             }
         });
 
         Ok(TcpServerSetupResult::AlreadyHandled)
     }
-}
 
-impl AnyTlsServerHandler {
     /// Forward the connection to a fallback destination when authentication fails.
     ///
     /// This makes the server indistinguishable from a legitimate server by transparently

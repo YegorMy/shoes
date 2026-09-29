@@ -78,7 +78,9 @@
 //! UDP flows use `connect_udp_bidirectional` on the same chain. Servers can be
 //! started inside the caller's tokio runtime with
 //! [`tcp::tcp_server::start_servers`] from configs validated by
-//! [`config::create_server_configs`].
+//! [`config::create_server_configs`]. An application that manages its own
+//! users and outbound policy starts them with
+//! [`embedding::start_servers_with_hooks`] instead.
 //!
 //! # Platform Support
 //!
@@ -98,6 +100,7 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
+pub mod embedding;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;

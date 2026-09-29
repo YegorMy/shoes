@@ -339,7 +339,10 @@ fn create_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(
+            create_tcp_client_proxy_selector(rules, resolver.clone())
+                .with_hooks_of(client_proxy_selector),
+        )
     } else {
         client_proxy_selector.clone()
     };
@@ -444,7 +447,10 @@ fn create_shadow_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(
+            create_tcp_client_proxy_selector(rules, resolver.clone())
+                .with_hooks_of(client_proxy_selector),
+        )
     } else {
         client_proxy_selector.clone()
     };
@@ -498,7 +504,10 @@ fn create_reality_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(
+            create_tcp_client_proxy_selector(rules, resolver.clone())
+                .with_hooks_of(client_proxy_selector),
+        )
     } else {
         client_proxy_selector.clone()
     };
@@ -611,7 +620,10 @@ fn create_websocket_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(
+            create_tcp_client_proxy_selector(rules, resolver.clone())
+                .with_hooks_of(client_proxy_selector),
+        )
     } else {
         client_proxy_selector.clone()
     };

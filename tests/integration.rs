@@ -2,6 +2,8 @@
 mod anytls;
 #[path = "cases/integration/anytls_uot_integration.rs"]
 mod anytls_uot;
+#[path = "cases/integration/embedding_hooks_integration.rs"]
+mod embedding_hooks;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
 #[path = "cases/integration/hysteria2_integration.rs"]

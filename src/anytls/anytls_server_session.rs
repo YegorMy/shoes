@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -232,6 +233,15 @@ impl AnyTlsSession {
     /// This starts the receive loop and processes frames until the connection closes.
     /// New streams are handled internally using the configured resolver and proxy_provider.
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
+        self.run_until_cancelled(None).await
+    }
+
+    /// Run the session until the connection closes or `cancel` is cancelled.
+    /// Cancellation closes the session and aborts all of its streams.
+    pub async fn run_until_cancelled(
+        self: &Arc<Self>,
+        cancel: Option<CancellationToken>,
+    ) -> io::Result<()> {
         let session = Arc::clone(self);
 
         // Start the outgoing data processor
@@ -241,7 +251,13 @@ impl AnyTlsSession {
         });
 
         // Run the receive loop
-        let result = session.recv_loop().await;
+        let result = match cancel {
+            Some(cancel) => tokio::select! {
+                result = session.recv_loop() => result,
+                () = cancel.cancelled() => Ok(()),
+            },
+            None => session.recv_loop().await,
+        };
 
         // Cleanup
         session.close().await;

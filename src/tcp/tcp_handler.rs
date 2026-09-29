@@ -67,6 +67,18 @@ impl TcpServerSetupResult {
             TcpServerSetupResult::AlreadyHandled => {}
         }
     }
+
+    /// The proxy selector that will route this connection, if the caller still
+    /// has to forward it.
+    pub fn proxy_selector(&self) -> Option<&Arc<ClientProxySelector>> {
+        match self {
+            TcpServerSetupResult::TcpForward { proxy_selector, .. }
+            | TcpServerSetupResult::BidirectionalUdp { proxy_selector, .. }
+            | TcpServerSetupResult::MultiDirectionalUdp { proxy_selector, .. }
+            | TcpServerSetupResult::SessionBasedUdp { proxy_selector, .. } => Some(proxy_selector),
+            TcpServerSetupResult::AlreadyHandled => None,
+        }
+    }
 }
 
 #[async_trait]

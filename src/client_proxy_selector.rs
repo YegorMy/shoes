@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::address::{AddressMask, NetLocationMask};
 use crate::client_proxy_chain::ClientChainGroup;
+use crate::embedding::{OutboundDecision, ServerHooks};
 use crate::resolver::{Resolver, resolve_location};
 
 /// Cache key for routing decisions.
@@ -198,6 +199,8 @@ pub struct ClientProxySelector {
     /// LRU cache for routing decisions. Speeds up repeated lookups for the same destination.
     /// None if caching is disabled (few rules and no DNS resolution).
     cache: Option<RoutingCache>,
+    /// Embedder hooks consulted after the rules allow a destination.
+    hooks: Option<Arc<dyn ServerHooks>>,
 }
 
 unsafe impl Send for ClientProxySelector {}
@@ -266,6 +269,57 @@ impl ClientProxySelector {
             rules,
             resolve_rule_hostnames,
             cache,
+            hooks: None,
+        }
+    }
+
+    /// Install embedder hooks. Every destination the rules allow is then
+    /// resolved and passed to [`ServerHooks::check_outbound`].
+    pub fn with_hooks(mut self, hooks: Arc<dyn ServerHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Carry over `parent`'s hooks, for selectors built from override rules.
+    pub fn with_hooks_of(mut self, parent: &ClientProxySelector) -> Self {
+        self.hooks = parent.hooks.clone();
+        self
+    }
+
+    pub fn hooks(&self) -> Option<&Arc<dyn ServerHooks>> {
+        self.hooks.as_ref()
+    }
+
+    /// Judge a connection request against the rules, then against the
+    /// embedder hooks if any are installed.
+    pub async fn judge<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        let decision = self.judge_rules(location, resolver).await?;
+        let Some(hooks) = &self.hooks else {
+            return Ok(decision);
+        };
+        let ConnectDecision::Allow {
+            chain_group,
+            mut remote_location,
+        } = decision
+        else {
+            return Ok(ConnectDecision::Block);
+        };
+        // Resolve before the check so the connection uses the checked address.
+        let resolved = resolve_location(&mut remote_location, resolver).await?;
+        match hooks.check_outbound(remote_location.location(), resolved) {
+            OutboundDecision::Allow => Ok(ConnectDecision::Allow {
+                chain_group,
+                remote_location,
+            }),
+            OutboundDecision::Block => Ok(ConnectDecision::Block),
+            OutboundDecision::Redirect(location) => Ok(ConnectDecision::Allow {
+                chain_group,
+                remote_location: location.into(),
+            }),
         }
     }
 
@@ -280,7 +334,7 @@ impl ClientProxySelector {
     /// Note: Caching is only enabled when `resolve_rule_hostnames` is true or there are
     /// more than 16 rules. For simple configurations, direct rule matching is faster.
     #[inline]
-    pub async fn judge<'a>(
+    async fn judge_rules<'a>(
         &'a self,
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
