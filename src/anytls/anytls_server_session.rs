@@ -34,6 +34,9 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
 const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Upper bound on the graceful writer shutdown when a session closes.
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -216,9 +219,10 @@ impl AnyTlsSession {
             let mut streams = self.streams.write().await;
             streams.clear();
 
-            // Try to shutdown writer gracefully
+            // Try to shutdown writer gracefully, bounded so a peer that stops
+            // reading cannot hold the closing session open.
             if let Ok(mut writer) = self.writer.try_lock() {
-                let _ = writer.shutdown().await;
+                let _ = tokio::time::timeout(WRITER_SHUTDOWN_TIMEOUT, writer.shutdown()).await;
             }
         }
     }
@@ -417,6 +421,9 @@ impl AnyTlsSession {
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
+                    // Lock before spawning, so a cancellation during the lock
+                    // wait cannot leave a spawned task that close() never aborts.
+                    let mut tasks = self.stream_tasks.lock().await;
                     let handle = tokio::spawn(async move {
                         // Apply timeout to entire stream handler lifetime
                         // This prevents memory leaks from hung streams
@@ -448,7 +455,6 @@ impl AnyTlsSession {
                     });
 
                     // Track the task for cancellation on session close
-                    let mut tasks = self.stream_tasks.lock().await;
                     tasks.insert(stream_id, handle);
                 }
             }

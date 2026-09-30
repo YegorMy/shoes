@@ -350,18 +350,23 @@ where
         session.padding_enabled()
     );
 
+    // Streams belong to the session: dropping this future (for example when an
+    // embedder cancels the session) aborts them, and a normal end waits for them.
+    let mut streams = tokio::task::JoinSet::new();
     while let Some(inbound) = session.accept().await {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        tokio::spawn(async move {
+        streams.spawn(async move {
             if let Err(e) =
                 handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
             {
                 debug!("H2MUX stream error: {}", e);
             }
         });
+        while streams.try_join_next().is_some() {}
     }
+    while streams.join_next().await.is_some() {}
 
     debug!("H2MUX: Session ended");
     Ok(())
