@@ -218,6 +218,7 @@ impl AnyTlsServerHandler {
         tokio::spawn(async move {
             let result = match grant {
                 Some(grant) => {
+                    let _done = grant.done_guard();
                     session
                         .run_until_cancelled(Some(grant.cancel_token().clone()))
                         .await

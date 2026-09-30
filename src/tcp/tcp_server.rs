@@ -169,10 +169,13 @@ where
 
     let forward = forward_setup_result(setup_result, resolver);
     match grant {
-        Some(grant) => tokio::select! {
-            result = forward => result,
-            () = grant.cancel_token().cancelled() => Ok(()),
-        },
+        Some(grant) => {
+            let _done = grant.done_guard();
+            tokio::select! {
+                result = forward => result,
+                () = grant.cancel_token().cancelled() => Ok(()),
+            }
+        }
         None => forward.await,
     }
 }

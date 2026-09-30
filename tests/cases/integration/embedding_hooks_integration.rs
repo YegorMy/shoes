@@ -46,6 +46,8 @@ struct TestHooks {
     refused: AtomicUsize,
     checked: Mutex<Vec<SocketAddr>>,
     targets_seen: Mutex<Vec<Option<String>>>,
+    /// One `done` token per granted session, in grant order.
+    done: Mutex<Vec<CancellationToken>>,
 }
 
 impl TestHooks {
@@ -58,6 +60,18 @@ impl TestHooks {
     }
 }
 
+impl TestHooks {
+    fn grant(&self, identity: String, cancel: CancellationToken) -> SessionGrant {
+        let done = CancellationToken::new();
+        self.done.lock().push(done.clone());
+        SessionGrant::with_done(identity, cancel, done)
+    }
+
+    fn done_token(&self, index: usize) -> CancellationToken {
+        self.done.lock()[index].clone()
+    }
+}
+
 impl ServerHooks for TestHooks {
     fn open_session(&self, auth: SessionAuth<'_>) -> Option<SessionGrant> {
         let grant = match auth {
@@ -67,13 +81,13 @@ impl ServerHooks for TestHooks {
                 .users
                 .lock()
                 .get(password_sha256)
-                .map(|(name, cancel)| SessionGrant::new(name.clone(), cancel.clone())),
+                .map(|(name, cancel)| self.grant(name.clone(), cancel.clone())),
             SessionAuth::Listener { target: None } => {
                 self.targets_seen.lock().push(None);
                 self.listener_session
                     .lock()
                     .clone()
-                    .map(|cancel| SessionGrant::new("listener", cancel))
+                    .map(|cancel| self.grant("listener".to_string(), cancel))
             }
             SessionAuth::Listener {
                 target: Some(target),
@@ -83,7 +97,7 @@ impl ServerHooks for TestHooks {
                     .lock()
                     .get(target)
                     .cloned()
-                    .map(|cancel| SessionGrant::new(target, cancel))
+                    .map(|cancel| self.grant(target.to_string(), cancel))
             }
             _ => None,
         };
@@ -504,6 +518,102 @@ protocol:
     let seen = hooks.targets_seen.lock().clone();
     assert!(seen.contains(&Some("a.hooks.test".to_string())));
     assert!(seen.contains(&Some("b.hooks.test".to_string())));
+
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+async fn wait_done(done: &CancellationToken) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), done.cancelled())
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn test_done_token_signals_anytls_session_end() -> TestResult {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut ports = PortHelper::new();
+    let echo = EchoServer::start().await?;
+    let echo_addr = echo.addr;
+
+    let (cert, key) = generate_test_cert_files()?;
+    let (ip, port) = ports.get_localhost_listener_port();
+    let hooks = Arc::new(TestHooks::default());
+    let device_a = hooks.add_user("device-a", "device-a-password");
+    let server_yaml = anytls_server_yaml(&ip, port, cert.to_str().unwrap(), key.to_str().unwrap());
+    let handles = start_hooked_servers(&server_yaml, &resolver, hooks.clone()).await?;
+    ports.wait_for_all_ports().await?;
+
+    let mut stream = connect(
+        anytls_client(&ip, port, "device-a-password")?,
+        echo_addr,
+        &resolver,
+    )
+    .await?;
+    assert_echo(&mut stream, b"hello before the client leaves").await;
+    let done = hooks.done_token(0);
+    assert!(!done.is_cancelled(), "a live session is not done");
+
+    // The client going away ends the session: `done` fires, while the user's
+    // shared cancel token is left alone for its other sessions.
+    drop(stream);
+    assert!(
+        wait_done(&done).await,
+        "session end must cancel its done token"
+    );
+    assert!(!device_a.is_cancelled());
+
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_done_token_signals_listener_session_end() -> TestResult {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut ports = PortHelper::new();
+    let echo = EchoServer::start().await?;
+    let echo_addr = echo.addr;
+
+    let (ip, port) = ports.get_localhost_listener_port();
+    let hooks = Arc::new(TestHooks::default());
+    let server_yaml = format!(
+        r#"
+- address: "{ip}:{port}"
+  protocol:
+    type: shadowsocks
+    cipher: aes-256-gcm
+    password: "{LISTENER_PASSWORD}"
+"#
+    );
+    let handles = start_hooked_servers(&server_yaml, &resolver, hooks.clone()).await?;
+    ports.wait_for_all_ports().await?;
+    let client: ClientConfig = serde_yaml::from_str(&format!(
+        r#"
+address: "{ip}:{port}"
+protocol:
+  type: shadowsocks
+  cipher: aes-256-gcm
+  password: "{LISTENER_PASSWORD}"
+"#
+    ))?;
+
+    let cancel = CancellationToken::new();
+    *hooks.listener_session.lock() = Some(cancel.clone());
+    let mut stream = connect(client, echo_addr, &resolver).await?;
+    assert_echo(&mut stream, b"hello before the listener client leaves").await;
+    let done = hooks.done_token(0);
+    assert!(!done.is_cancelled(), "a live session is not done");
+
+    drop(stream);
+    assert!(
+        wait_done(&done).await,
+        "session end must cancel its done token"
+    );
+    assert!(!cancel.is_cancelled());
 
     for handle in handles {
         handle.abort();

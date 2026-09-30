@@ -44,7 +44,8 @@ pub trait ServerHooks: Send + Sync + Debug {
     /// A refused session is treated like one with an unknown password (for
     /// AnyTLS this includes the configured `fallback`, if any). When hooks are
     /// installed, this method decides: the users configured for the listener
-    /// are not consulted.
+    /// are not consulted. Grant with [`SessionGrant::with_done`] to learn when
+    /// the session ends.
     fn open_session(&self, auth: SessionAuth<'_>) -> Option<SessionGrant>;
 
     /// Called before every outbound TCP connection and every UDP destination
@@ -79,6 +80,7 @@ pub enum SessionAuth<'a> {
 pub struct SessionGrant {
     identity: String,
     cancel: CancellationToken,
+    done: Option<CancellationToken>,
 }
 
 impl SessionGrant {
@@ -88,7 +90,32 @@ impl SessionGrant {
         Self {
             identity: identity.into(),
             cancel,
+            done: None,
         }
+    }
+
+    /// Like [`Self::new`], and the server also cancels `done` once the session
+    /// has ended for any reason, so the embedder can release per-session state.
+    /// Pass a fresh `done` token for every session.
+    pub fn with_done(
+        identity: impl Into<String>,
+        cancel: CancellationToken,
+        done: CancellationToken,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            cancel,
+            done: Some(done),
+        }
+    }
+
+    pub fn done_token(&self) -> Option<&CancellationToken> {
+        self.done.as_ref()
+    }
+
+    /// Cancels `done` when dropped; the server holds it for the session's life.
+    pub(crate) fn done_guard(&self) -> Option<tokio_util::sync::DropGuard> {
+        self.done.clone().map(CancellationToken::drop_guard)
     }
 
     pub fn identity(&self) -> &str {
