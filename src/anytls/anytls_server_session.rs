@@ -250,11 +250,13 @@ impl AnyTlsSession {
             session_clone.process_outgoing().await;
         });
 
-        // Run the receive loop
+        // Run the receive loop. Cancellation is checked first, so a session
+        // cancelled before or while it runs handles no further frames.
         let result = match cancel {
             Some(cancel) => tokio::select! {
-                result = session.recv_loop() => result,
+                biased;
                 () = cancel.cancelled() => Ok(()),
+                result = session.recv_loop() => result,
             },
             None => session.recv_loop().await,
         };

@@ -171,9 +171,12 @@ where
     match grant {
         Some(grant) => {
             let _done = grant.done_guard();
+            // Cancellation is checked first, so a cancelled session never
+            // starts or continues forwarding.
             tokio::select! {
-                result = forward => result,
+                biased;
                 () = grant.cancel_token().cancelled() => Ok(()),
+                result = forward => result,
             }
         }
         None => forward.await,

@@ -332,6 +332,42 @@ async fn test_anytls_hooks_authenticate_and_cancel_sessions() -> TestResult {
 }
 
 #[tokio::test]
+async fn test_anytls_session_with_cancelled_grant_never_connects() -> TestResult {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut ports = PortHelper::new();
+    let echo = EchoServer::start().await?;
+
+    let (cert, key) = generate_test_cert_files()?;
+    let (ip, port) = ports.get_localhost_listener_port();
+    let hooks = Arc::new(TestHooks::default());
+    // The embedder revoked the user before the session starts.
+    hooks.add_user("device-a", "device-a-password").cancel();
+    let server_yaml = anytls_server_yaml(&ip, port, cert.to_str().unwrap(), key.to_str().unwrap());
+    let handles = start_hooked_servers(&server_yaml, &resolver, hooks.clone()).await?;
+    ports.wait_for_all_ports().await?;
+
+    if let Ok(mut stream) = connect(
+        anytls_client(&ip, port, "device-a-password")?,
+        echo.addr,
+        &resolver,
+    )
+    .await
+    {
+        assert_no_echo(&mut stream).await;
+    }
+    assert_eq!(
+        echo.accepted(),
+        0,
+        "a session whose grant is already cancelled must not open connections"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hooks_block_and_redirect_outbound() -> TestResult {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let mut ports = PortHelper::new();
