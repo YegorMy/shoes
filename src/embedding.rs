@@ -80,7 +80,19 @@ pub enum SessionAuth<'a> {
 pub struct SessionGrant {
     identity: String,
     cancel: CancellationToken,
-    done: Option<CancellationToken>,
+    done: Option<Arc<DoneOnDrop>>,
+}
+
+/// Cancels the embedder's `done` token once the last clone of its grant is
+/// dropped, so a grant the server drops without running a session still
+/// signals `done`.
+#[derive(Debug)]
+struct DoneOnDrop(CancellationToken);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl SessionGrant {
@@ -96,7 +108,9 @@ impl SessionGrant {
 
     /// Like [`Self::new`], and the server also cancels `done` once the session
     /// has ended for any reason, so the embedder can release per-session state.
-    /// Pass a fresh `done` token for every session.
+    /// `done` is also cancelled when the server drops the grant without running
+    /// a session (for example, the client closed before finishing its
+    /// handshake). Pass a fresh `done` token for every session.
     pub fn with_done(
         identity: impl Into<String>,
         cancel: CancellationToken,
@@ -105,17 +119,19 @@ impl SessionGrant {
         Self {
             identity: identity.into(),
             cancel,
-            done: Some(done),
+            done: Some(Arc::new(DoneOnDrop(done))),
         }
     }
 
     pub fn done_token(&self) -> Option<&CancellationToken> {
-        self.done.as_ref()
+        self.done.as_deref().map(|done| &done.0)
     }
 
     /// Cancels `done` when dropped; the server holds it for the session's life.
     pub(crate) fn done_guard(&self) -> Option<tokio_util::sync::DropGuard> {
-        self.done.clone().map(CancellationToken::drop_guard)
+        self.done_token()
+            .cloned()
+            .map(CancellationToken::drop_guard)
     }
 
     pub fn identity(&self) -> &str {
@@ -136,4 +152,41 @@ pub enum OutboundDecision {
     Block,
     /// Connect to this location instead.
     Redirect(NetLocation),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dropping_an_unused_grant_cancels_done() {
+        let done = CancellationToken::new();
+        let grant = SessionGrant::with_done("user", CancellationToken::new(), done.clone());
+        assert!(!done.is_cancelled());
+        drop(grant);
+        assert!(done.is_cancelled());
+    }
+
+    #[test]
+    fn test_done_waits_for_the_last_clone() {
+        let done = CancellationToken::new();
+        let grant = SessionGrant::with_done("user", CancellationToken::new(), done.clone());
+        let clone = grant.clone();
+        drop(grant);
+        assert!(!done.is_cancelled());
+        drop(clone);
+        assert!(done.is_cancelled());
+    }
+
+    #[test]
+    fn test_dropping_a_grant_never_cancels_the_session() {
+        let cancel = CancellationToken::new();
+        drop(SessionGrant::with_done(
+            "user",
+            cancel.clone(),
+            CancellationToken::new(),
+        ));
+        drop(SessionGrant::new("user", cancel.clone()));
+        assert!(!cancel.is_cancelled());
+    }
 }
