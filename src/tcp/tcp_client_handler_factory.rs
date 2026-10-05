@@ -289,14 +289,12 @@ pub fn create_tcp_client_handler(
             );
             // The signed ClientHello enters rustls's transcript before TLS 1.3
             // completes certificate, signature and Finished verification.
-            let client_config = Arc::new(create_client_config(
-                verify,
-                fingerprints,
-                Vec::new(), // No ALPN
-                enable_sni, // Enable SNI if hostname provided
-                None,       // No client cert
-                true,       // tls13_only - required for ShadowTLS v3
-            ));
+            let client_config =
+                Arc::new(crate::rustls_config_util::create_shadowtls_client_config(
+                    verify,
+                    fingerprints,
+                    enable_sni,
+                ));
 
             let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
 

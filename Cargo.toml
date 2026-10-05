@@ -97,6 +97,7 @@ rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem
 rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
+rustls-platform-verifier = "=0.7.0"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
 shake = "*"

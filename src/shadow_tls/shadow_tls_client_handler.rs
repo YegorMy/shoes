@@ -338,7 +338,11 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
-    async fn webpki_handshake(cert_name: &str) -> std::io::Result<ShadowTlsStream> {
+    async fn trusted_handshake(
+        cert_name: &str,
+        platform: bool,
+        mismatch_pin: bool,
+    ) -> std::io::Result<ShadowTlsStream> {
         let password = "webpki-flight-test-password";
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(vec!["test-ca".into()]).unwrap();
@@ -367,15 +371,26 @@ mod tests {
         let config = create_server_configs(configs).unwrap().configs.remove(0);
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         let handles = start_servers(config, resolver.clone()).await.unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config = if platform {
+            crate::rustls_config_util::create_shadowtls_test_config(
+                ca.der().clone(),
+                if mismatch_pin {
+                    vec!["00".repeat(32)]
+                } else {
+                    Vec::new()
+                },
+            )
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+        };
         let inner: ClientProxyConfig = serde_yaml::from_str(
             "type: shadowsocks\ncipher: aes-128-gcm\npassword: inner-test-password\n",
         )
@@ -413,12 +428,16 @@ mod tests {
 
     #[tokio::test]
     async fn shadowtls_webpki_verifies_the_actual_ca_signed_certificate_flight() {
-        assert!(webpki_handshake("handshake.test").await.is_ok());
+        assert!(
+            trusted_handshake("handshake.test", false, false)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn shadowtls_webpki_rejects_wrong_name_in_the_actual_trusted_flight() {
-        let result = webpki_handshake("other.test").await;
+        let result = trusted_handshake("other.test", false, false).await;
         let error = match result {
             Ok(_) => panic!("wrong certificate identity was accepted"),
             Err(e) => e,
@@ -428,5 +447,40 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("webpki-flight-test-password"));
+    }
+
+    #[tokio::test]
+    async fn shadowtls_platform_verifies_the_actual_ca_signed_certificate_flight() {
+        assert!(
+            trusted_handshake("handshake.test", true, false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn shadowtls_platform_rejects_wrong_name_in_the_actual_trusted_flight() {
+        let error = match trusted_handshake("other.test", true, false).await {
+            Ok(_) => panic!("wrong certificate identity was accepted"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("NotValidForName")
+                || message.contains("certificate not valid for name"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadowtls_platform_and_pin_both_apply_in_the_actual_trusted_flight() {
+        let error = match trusted_handshake("handshake.test", true, true).await {
+            Ok(_) => panic!("platform trust bypassed the mismatching pin"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unknown server fingerprint"),
+            "{error}"
+        );
     }
 }

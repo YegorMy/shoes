@@ -500,7 +500,7 @@ protocol:
   type: shadowtls
   password: string
   sni_hostname: string?        # Optional SNI override
-  verify: true                # WebPKI certificate and name verification (default)
+  verify: true                # Platform certificate and name verification (default)
   server_fingerprints: []      # Optional enforced SHA-256 certificate pins
   protocol: ClientProxyConfig
 ```
@@ -508,8 +508,14 @@ protocol:
 ShadowTLS v3 completes the handshake host's real TLS 1.3 certificate, signature,
 and Finished verification before starting the inner protocol. `verify: false`
 requires a nonempty pin list; it authenticates the exact pinned certificate.
-With `verify: true`, both WebPKI and any configured pins are enforced. WebPKI
-requires SNI (explicit or inferred from the endpoint hostname). Resumption, early
+With `verify: true`, both platform trust and any configured pins are enforced. Verification
+requires SNI (explicit or inferred from the endpoint hostname). Missing or invalid
+verification names are rejected during configuration validation. On Apple targets,
+including iOS, trust uses Security.framework and its system/keychain certificates;
+other targets use rustls-platform-verifier's platform backend. Failure to initialize
+that verifier fails the handshake; it never selects an unchecked or bundled-root
+fallback. Ordinary TLS and DNS configurations retain their existing trust backend.
+Resumption, early
 data, ECH, QUIC, and HelloRetryRequest are disabled or refused on this path.
 
 The maintained `vendor/rustls` hook signs ClientHello's existing v3 session ID

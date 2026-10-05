@@ -1,3 +1,8 @@
+mod shadowtls;
+pub(crate) use shadowtls::create_shadowtls_client_config;
+#[cfg(test)]
+pub(crate) use shadowtls::create_shadowtls_test_config;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
