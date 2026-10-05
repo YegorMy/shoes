@@ -912,7 +912,11 @@ fn validate_client_config(
         ));
     }
 
-    validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
+    validate_client_proxy_config(
+        &mut client_config.protocol,
+        named_pems,
+        client_config.address.address().hostname(),
+    )?;
 
     Ok(())
 }
@@ -938,6 +942,7 @@ fn validate_server_fingerprints(
 fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
     named_pems: &HashMap<String, String>,
+    default_sni_hostname: Option<&str>,
 ) -> std::io::Result<()> {
     validate_client_proxy_structure(client_proxy_config)?;
 
@@ -954,7 +959,7 @@ fn validate_client_proxy_config(
                 );
             }
 
-            validate_client_proxy_config(protocol, named_pems)?;
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Tls(tls_config) => {
@@ -969,12 +974,13 @@ fn validate_client_proxy_config(
             }
             validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
 
-            validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut tls_config.protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::ShadowTls {
             verify,
             server_fingerprints,
+            sni_hostname,
             protocol,
             ..
         } => {
@@ -985,11 +991,28 @@ fn validate_client_proxy_config(
                     "ShadowTLS requires certificate verification or pins",
                 ));
             }
-            validate_client_proxy_config(protocol, named_pems)?;
+            match sni_hostname.as_deref().or(default_sni_hostname) {
+                Some(name) => {
+                    rustls::pki_types::ServerName::try_from(name).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "ShadowTLS verification name is invalid",
+                        )
+                    })?;
+                }
+                None if *verify => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "ShadowTLS certificate verification requires SNI",
+                    ));
+                }
+                None => {}
+            }
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
         }
 
         _ => {}
@@ -1503,6 +1526,68 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
+
+    #[test]
+    fn shadowtls_sni_validation_matches_handler_construction() {
+        let pin = "ab".repeat(32);
+        let cases = [
+            ("127.0.0.1:443", "", "", false),
+            ("handshake.test:443", "", "", true),
+            (
+                "127.0.0.1:443",
+                "  sni_hostname: handshake.test\n",
+                "",
+                true,
+            ),
+            (
+                "127.0.0.1:443",
+                "  sni_hostname: 'invalid name'\n",
+                "",
+                false,
+            ),
+        ];
+        for (address, sni, trust, accepted) in cases {
+            let yaml = format!(
+                "address: '{address}'\nprotocol:\n  type: shadowtls\n  password: test-only\n{sni}{trust}  protocol:\n    type: socks\n"
+            );
+            let mut client: ClientConfig = serde_yaml::from_str(&yaml).unwrap();
+            let result = validate_client_config(&mut client, &HashMap::new());
+            if accepted {
+                result.expect("valid explicit or inferred name must validate");
+                let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
+                assert!(
+                    crate::tcp::proxy_connector_impl::ProxyConnectorImpl::from_config(
+                        client, resolver
+                    )
+                    .is_some()
+                );
+            } else {
+                let error = result.expect_err("invalid name must fail before construction");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(!error.to_string().contains("test-only"));
+            }
+        }
+
+        let mut pin_only: ClientConfig = serde_yaml::from_str(&format!(
+            "address: '127.0.0.1:443'\nprotocol:\n  type: shadowtls\n  password: test-only\n  verify: false\n  server_fingerprints: ['{pin}']\n  protocol:\n    type: socks\n"
+        ))
+        .unwrap();
+        validate_client_config(&mut pin_only, &HashMap::new())
+            .expect("pin-only trust retains its missing-SNI behavior");
+        let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
+        assert!(
+            crate::tcp::proxy_connector_impl::ProxyConnectorImpl::from_config(pin_only, resolver)
+                .is_some()
+        );
+
+        let mut nested: ClientConfig = serde_yaml::from_str(
+            "address: 'handshake.test:443'\nprotocol:\n  type: tls\n  verify: false\n  protocol:\n    type: shadowtls\n    password: test-only\n    protocol:\n      type: socks\n",
+        )
+        .unwrap();
+        let error = validate_client_config(&mut nested, &HashMap::new())
+            .expect_err("nested handlers cannot inherit the outer endpoint SNI");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
