@@ -391,7 +391,7 @@ pub enum ClientProxyConfig {
         /// ShadowTLS password for authentication
         password: String,
 
-        /// Verify the handshake host certificate against WebPKI roots.
+        /// Verify the handshake host certificate against platform/system roots.
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         verify: bool,
 
