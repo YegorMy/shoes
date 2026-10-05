@@ -116,7 +116,38 @@ async fn start_shadowtls_server(
                 .expect("server must start"),
         );
     }
-    ServerGuard { handles }
+    let guard = ServerGuard { handles };
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let connected = tokio::time::timeout_at(
+            deadline,
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await
+        .expect("ShadowTLS listener readiness timed out");
+        match connected {
+            Ok(stream) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "ShadowTLS listener readiness exceeded its deadline"
+                );
+                drop(stream);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                assert!(
+                    guard.handles.iter().all(|handle| !handle.is_finished()),
+                    "ShadowTLS listener stopped before accepting connections"
+                );
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+                )
+                .await;
+            }
+            Err(error) => panic!("ShadowTLS listener unavailable: {error}"),
+        }
+    }
+    guard
 }
 
 /// Starts a loopback echo server and returns (port, connection counter).
