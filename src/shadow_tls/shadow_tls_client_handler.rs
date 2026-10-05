@@ -2,13 +2,12 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rand::Rng;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::buf_reader::BufReader;
 use crate::rustls_connection_util::feed_rustls_client_connection;
 use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
@@ -22,16 +21,24 @@ use super::shadow_tls_server_handler::parse_validated_server_hello;
 // TODO: deduplicate consts
 const TLS_HEADER_LEN: usize = 5;
 const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
-const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 const CONTENT_TYPE_ALERT: u8 = 0x15;
 
 // Handshake message types
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 
+struct ShadowTlsXorContext(aws_lc_rs::digest::Context);
+
+impl std::fmt::Debug for ShadowTlsXorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[ShadowTlsXorContext]")
+    }
+}
+
 #[derive(Debug)]
 pub struct ShadowTlsClientHandler {
     initial_hmac: ShadowTlsHmac,
+    initial_xor_context: ShadowTlsXorContext,
     client_config: Arc<rustls::ClientConfig>,
     server_name: rustls::pki_types::ServerName<'static>,
     handler: Box<dyn TcpClientHandler>,
@@ -44,14 +51,23 @@ impl ShadowTlsClientHandler {
         server_name: rustls::pki_types::ServerName<'static>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
+        let password_bytes = password.into_bytes();
         let hmac_key = aws_lc_rs::hmac::Key::new(
             aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            &password.into_bytes(),
+            &password_bytes,
         );
         let initial_hmac = ShadowTlsHmac::new(&hmac_key);
+        let mut initial_xor_context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        initial_xor_context.update(&password_bytes);
+        let mut client_config = (*client_config).clone();
+        let hello_hmac = initial_hmac.clone();
+        client_config.set_client_hello_session_id_generator(move |hello| {
+            signed_session_id(hello, &hello_hmac)
+        });
         Self {
             initial_hmac,
-            client_config,
+            initial_xor_context: ShadowTlsXorContext(initial_xor_context),
+            client_config: Arc::new(client_config),
             server_name,
             handler,
         }
@@ -77,9 +93,7 @@ impl ShadowTlsClientHandler {
             ));
         }
 
-        let modified_client_hello = modify_client_hello(&client_hello_buf, &self.initial_hmac)?;
-
-        write_all(&mut client_stream, &modified_client_hello).await?;
+        write_all(&mut client_stream, &client_hello_buf).await?;
         client_stream.flush().await?;
 
         let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
@@ -90,6 +104,12 @@ impl ShadowTlsClientHandler {
             read_tls_frame(&mut remote_reader, &mut client_stream, &mut frame_buf).await?;
 
         let parsed_server_hello = parse_validated_server_hello(server_hello_frame)?;
+        if !parsed_server_hello.is_tls13 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ShadowTLS requires TLS 1.3",
+            ));
+        }
 
         feed_rustls_client_connection(&mut client_conn, server_hello_frame)?;
         client_conn.process_new_packets().map_err(|e| {
@@ -107,6 +127,12 @@ impl ShadowTlsClientHandler {
 
         let mut hmac_server_data = hmac_server_random.clone();
         hmac_server_data.update(b"S");
+        let server_app_data_xor = {
+            let mut context = self.initial_xor_context.0.clone();
+            context.update(&parsed_server_hello.server_random);
+            context.finish()
+        };
+        let mut authenticated_server = false;
 
         while client_conn.is_handshaking() {
             if client_conn.wants_write() {
@@ -131,12 +157,8 @@ impl ShadowTlsClientHandler {
             let content_type = server_frame[0];
 
             if content_type == CONTENT_TYPE_APPLICATION_DATA {
-                // Encrypted TLS 1.3 handshake record from the handshake server.
-                // Validates HMAC and then breaks from handshake loop.
                 let payload_len = u16::from_be_bytes([server_frame[3], server_frame[4]]) as usize;
                 if payload_len < 4 + 1 {
-                    // Requires at least 4 bytes for HMAC digest plus non-empty data.
-                    // TODO: should this check for a larger record size?
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "app data record too short for handshake data",
@@ -148,14 +170,31 @@ impl ShadowTlsClientHandler {
                     &server_frame[TLS_HEADER_LEN + 4..TLS_HEADER_LEN + payload_len];
 
                 hmac_server_random.update(data_after_hmac);
-                if hmac_server_random.digest() != received_hmac {
+                if !bool::from(hmac_server_random.digest().as_slice().ct_eq(received_hmac)) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid HMAC for handshake data",
                     ));
                 }
 
-                break;
+                authenticated_server = true;
+                let mut tls_frame = Vec::with_capacity(server_frame.len() - 4);
+                tls_frame.extend_from_slice(&server_frame[..TLS_HEADER_LEN]);
+                tls_frame[3..5].copy_from_slice(&((payload_len - 4) as u16).to_be_bytes());
+                tls_frame.extend(
+                    data_after_hmac
+                        .iter()
+                        .zip(server_app_data_xor.as_ref().iter().cycle())
+                        .map(|(byte, key)| byte ^ key),
+                );
+                feed_rustls_client_connection(&mut client_conn, &tls_frame)?;
+                client_conn.process_new_packets().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("ShadowTLS certificate handshake failed: {e}"),
+                    )
+                })?;
+                continue;
             }
 
             if content_type == CONTENT_TYPE_ALERT {
@@ -173,6 +212,21 @@ impl ShadowTlsClientHandler {
                 )
             })?;
         }
+
+        if !authenticated_server {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ShadowTLS server authentication missing",
+            ));
+        }
+        // Certificate/Finished validation precedes inner traffic; forward our
+        // Finished even when rustls has already left its handshaking state.
+        while client_conn.wants_write() {
+            let mut pending = Vec::new();
+            client_conn.write_tls(&mut pending)?;
+            write_all(&mut client_stream, &pending).await?;
+        }
+        client_stream.flush().await?;
 
         let mut shadow_tls_stream = ShadowTlsStream::new(
             client_stream,
@@ -221,127 +275,33 @@ impl TcpClientHandler for ShadowTlsClientHandler {
     }
 }
 
-// TODO: consider reusing server read_client_hello code
-#[inline]
-fn modify_client_hello(
-    original_frame: &[u8],
+// Sign the handshake bytes before rustls records them in its transcript.
+fn signed_session_id(
+    client_hello: &[u8],
     initial_hmac: &ShadowTlsHmac,
-) -> std::io::Result<Vec<u8>> {
-    if original_frame.len() < TLS_HEADER_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello frame too short for header",
+) -> Result<[u8; 32], rustls::Error> {
+    const SESSION_ID_START: usize = 39;
+    const SESSION_ID_END: usize = SESSION_ID_START + 32;
+    const TAG_START: usize = SESSION_ID_END - 4;
+    if client_hello.len() < SESSION_ID_END
+        || client_hello[0] != HANDSHAKE_TYPE_CLIENT_HELLO
+        || client_hello[4..6] != [3, 3]
+        || client_hello[SESSION_ID_START - 1] != 32
+        || u32::from_be_bytes([0, client_hello[1], client_hello[2], client_hello[3]]) as usize
+            != client_hello.len() - 4
+    {
+        return Err(rustls::Error::General(
+            "unsupported ShadowTLS ClientHello".into(),
         ));
     }
-    if original_frame[0] != CONTENT_TYPE_HANDSHAKE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Expected ClientHello handshake content type",
-        ));
-    }
-
-    // TLS 1.3 ClientHello is sent in a TLS 1.0 (0x0301) or TLS 1.2 (0x0303) record format.
-    let record_protocol_version_ok =
-        original_frame[1] == 0x03 && (original_frame[2] == 0x01 || original_frame[2] == 0x03);
-    if !record_protocol_version_ok {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Unexpected ClientHello record TLS version {}.{}",
-                original_frame[1], original_frame[2]
-            ),
-        ));
-    }
-
-    let original_payload_len = u16::from_be_bytes([original_frame[3], original_frame[4]]) as usize;
-    if original_frame.len() != TLS_HEADER_LEN + original_payload_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello frame length mismatch",
-        ));
-    }
-
-    let mut reader = BufReader::new(&original_frame[TLS_HEADER_LEN..]);
-
-    let handshake_type = reader.read_u8()?;
-    if handshake_type != HANDSHAKE_TYPE_CLIENT_HELLO {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Expected ClientHello handshake message type",
-        ));
-    }
-
-    let client_hello_payload_len = reader.read_u24_be()? as usize;
-    if reader.position() + client_hello_payload_len != original_payload_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello message length inconsistent with record payload length",
-        ));
-    }
-
-    let ch_protocol_ver_major = reader.read_u8()?;
-    let ch_protocol_ver_minor = reader.read_u8()?;
-    // TLS 1.3 ClientHello message itself states version TLS 1.2 (0x0303)
-    if ch_protocol_ver_major != 0x03 || ch_protocol_ver_minor != 0x03 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "ClientHello message version is {ch_protocol_ver_major}.{ch_protocol_ver_minor}, expected 3.3 for TLS 1.3"
-            ),
-        ));
-    }
-
-    let client_random = reader.read_slice(32)?.to_vec();
-
-    let original_session_id_len = reader.read_u8()? as usize;
-    if original_session_id_len != 0 {
-        // This is random data for TLS1.3 and unused, but still populated for middlebox compatibility.
-        if original_session_id_len != 32 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Original ClientHello SessionID is not 32 bytes",
-            ));
-        }
-        reader.skip(32)?;
-    }
-
-    // The rest of the ClientHello message (cipher suites, compression, extensions)
-    let remaining_ch_data_offset = reader.position();
-    let remaining_ch_data = &original_frame[TLS_HEADER_LEN + remaining_ch_data_offset..];
-
-    // new length for the session id
-    let new_client_hello_payload_len = client_hello_payload_len + (32 - original_session_id_len);
-
-    // 4 bytes more because of handshake message type (1 byte) and hello data length (3 bytes)
-    let new_record_payload_len = new_client_hello_payload_len + 4;
-
-    let mut modified_frame = allocate_vec(TLS_HEADER_LEN + new_record_payload_len);
-
-    modified_frame[0] = CONTENT_TYPE_HANDSHAKE;
-    modified_frame[1] = original_frame[1]; // Record protocol major (e.g., 0x03)
-    modified_frame[2] = original_frame[2]; // Record protocol minor (e.g., 0x01 or 0x03)
-    modified_frame[3..5].copy_from_slice(&(new_record_payload_len as u16).to_be_bytes());
-
-    modified_frame[5] = handshake_type;
-    // skip the first byte for u24
-    modified_frame[6..9].copy_from_slice(&(new_client_hello_payload_len as u32).to_be_bytes()[1..]);
-    modified_frame[9] = ch_protocol_ver_major;
-    modified_frame[10] = ch_protocol_ver_minor;
-    modified_frame[11..43].copy_from_slice(&client_random);
-
-    // session id
-    modified_frame[43] = 32u8;
-    // first 28 bytes of the session id, last 4 bytes (72..76) will be the digest
-    rand::rng().fill_bytes(&mut modified_frame[44..72]);
-    modified_frame[72..76].copy_from_slice(&[0, 0, 0, 0]);
-    modified_frame[76..].copy_from_slice(remaining_ch_data);
-
-    let mut hmac_ctx = initial_hmac.clone();
-    hmac_ctx.update(&modified_frame[TLS_HEADER_LEN..]);
-    let hmac_tag = hmac_ctx.finalized_digest();
-    modified_frame[72..76].copy_from_slice(&hmac_tag);
-
-    Ok(modified_frame)
+    let mut session_id = [0u8; 32];
+    session_id.copy_from_slice(&client_hello[SESSION_ID_START..SESSION_ID_END]);
+    let mut hmac = initial_hmac.clone();
+    hmac.update(&client_hello[..TAG_START]);
+    hmac.update(&[0; 4]);
+    hmac.update(&client_hello[SESSION_ID_END..]);
+    session_id[28..].copy_from_slice(&hmac.finalized_digest());
+    Ok(session_id)
 }
 
 #[inline]
@@ -366,4 +326,107 @@ async fn read_tls_frame<'a>(
     read_buf[TLS_HEADER_LEN..TLS_HEADER_LEN + payload_len].copy_from_slice(payload_bytes);
 
     Ok(&read_buf[..TLS_HEADER_LEN + payload_len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClientProxyConfig, Config, create_server_configs};
+    use crate::resolver::{NativeResolver, Resolver};
+    use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
+    use crate::tcp::tcp_server::start_servers;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    async fn webpki_handshake(cert_name: &str) -> std::io::Result<ShadowTlsStream> {
+        let password = "webpki-flight-test-password";
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec![cert_name.into()])
+            .unwrap()
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .unwrap();
+        let indent = |pem: &str| {
+            pem.lines()
+                .map(|line| format!("            {line}\n"))
+                .collect::<String>()
+        };
+        let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let yaml = format!(
+            "- address: \"127.0.0.1:{port}\"\n  protocol:\n    type: tls\n    shadowtls_targets:\n      handshake.test:\n        password: \"{password}\"\n        handshake:\n          cert: |\n{}          key: |\n{}        protocol:\n          type: shadowsocks\n          cipher: aes-128-gcm\n          password: inner-test-password\n",
+            indent(&leaf.pem()),
+            indent(&leaf_key.serialize_pem())
+        );
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        let config = create_server_configs(configs).unwrap().configs.remove(0);
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let handles = start_servers(config, resolver.clone()).await.unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let inner: ClientProxyConfig = serde_yaml::from_str(
+            "type: shadowsocks\ncipher: aes-128-gcm\npassword: inner-test-password\n",
+        )
+        .unwrap();
+        let handler = ShadowTlsClientHandler::new(
+            password.into(),
+            Arc::new(config),
+            "handshake.test".try_into().unwrap(),
+            create_tcp_client_handler(inner, None, resolver),
+        );
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
+                Ok(stream) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused
+                        && tokio::time::Instant::now() < ready_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("local engine listener failed to bind: {error}"),
+            }
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.setup_client_stream_common(Box::new(stream)),
+        )
+        .await
+        .expect("local certificate flight must terminate");
+        for handle in handles {
+            handle.abort();
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn shadowtls_webpki_verifies_the_actual_ca_signed_certificate_flight() {
+        assert!(webpki_handshake("handshake.test").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shadowtls_webpki_rejects_wrong_name_in_the_actual_trusted_flight() {
+        let result = webpki_handshake("other.test").await;
+        let error = match result {
+            Ok(_) => panic!("wrong certificate identity was accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            error.to_string().contains("certificate not valid for name"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("webpki-flight-test-password"));
+    }
 }

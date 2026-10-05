@@ -500,8 +500,21 @@ protocol:
   type: shadowtls
   password: string
   sni_hostname: string?        # Optional SNI override
+  verify: true                # WebPKI certificate and name verification (default)
+  server_fingerprints: []      # Optional enforced SHA-256 certificate pins
   protocol: ClientProxyConfig
 ```
+
+ShadowTLS v3 completes the handshake host's real TLS 1.3 certificate, signature,
+and Finished verification before starting the inner protocol. `verify: false`
+requires a nonempty pin list; it authenticates the exact pinned certificate.
+With `verify: true`, both WebPKI and any configured pins are enforced. WebPKI
+requires SNI (explicit or inferred from the endpoint hostname). Resumption, early
+data, ECH, QUIC, and HelloRetryRequest are disabled or refused on this path.
+
+The maintained `vendor/rustls` hook signs ClientHello's existing v3 session ID
+before transcript hashing. Consumers must apply the same Rustls patch at their
+workspace root; Cargo does not inherit dependency-level patches.
 
 ### WebSocket Client
 ```yaml

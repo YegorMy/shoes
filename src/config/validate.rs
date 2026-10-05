@@ -972,7 +972,19 @@ fn validate_client_proxy_config(
             validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
         }
 
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
+        ClientProxyConfig::ShadowTls {
+            verify,
+            server_fingerprints,
+            protocol,
+            ..
+        } => {
+            validate_server_fingerprints(server_fingerprints)?;
+            if !*verify && server_fingerprints.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowTLS requires certificate verification or pins",
+                ));
+            }
             validate_client_proxy_config(protocol, named_pems)?;
         }
 

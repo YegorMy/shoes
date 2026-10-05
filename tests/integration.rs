@@ -24,6 +24,8 @@ mod shadowsocks_cross_protocol_udp;
 mod shadowsocks_uot;
 #[path = "cases/integration/shadowsocks_uot_edge_cases.rs"]
 mod shadowsocks_uot_edge_cases;
+#[path = "cases/integration/shadowtls_cert_verification.rs"]
+mod shadowtls_cert_verification;
 #[path = "cases/integration/snell_integration.rs"]
 mod snell;
 #[path = "cases/integration/socks_integration.rs"]

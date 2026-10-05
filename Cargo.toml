@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 members = ["tests/support"]
+exclude = ["vendor/rustls"]
 resolver = "3"
 
 [lib]
@@ -138,3 +139,6 @@ ndk-sys = "*"
 opt-level = 3
 lto = "fat"
 strip = true
+
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }

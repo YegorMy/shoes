@@ -237,7 +237,7 @@ where
         // Transform to ShadowTLS variant internally by wrapping protocol
         return Ok(TlsClientConfig {
             verify: temp.verify,
-            server_fingerprints: temp.server_fingerprints,
+            server_fingerprints: temp.server_fingerprints.clone(),
             sni_hostname: temp.sni_hostname.clone(),
             alpn_protocols: temp.alpn_protocols,
             tls_buffer_size: temp.tls_buffer_size,
@@ -246,6 +246,8 @@ where
             vision: false,
             protocol: Box::new(ClientProxyConfig::ShadowTls {
                 password,
+                verify: temp.verify,
+                server_fingerprints: temp.server_fingerprints.clone(),
                 sni_hostname: temp.sni_hostname.into_option(),
                 protocol: temp.protocol,
             }),
@@ -388,6 +390,18 @@ pub enum ClientProxyConfig {
     ShadowTls {
         /// ShadowTLS password for authentication
         password: String,
+
+        /// Verify the handshake host certificate against WebPKI roots.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        verify: bool,
+
+        /// Enforce these SHA-256 handshake certificate fingerprints.
+        #[serde(
+            alias = "server_fingerprint",
+            default,
+            skip_serializing_if = "NoneOrSome::is_unspecified"
+        )]
+        server_fingerprints: NoneOrSome<String>,
 
         /// Optional SNI hostname override
         #[serde(default, skip_serializing_if = "Option::is_none")]

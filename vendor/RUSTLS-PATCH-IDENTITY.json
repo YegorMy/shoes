@@ -1,0 +1,31 @@
+{
+  "version": "0.23.45",
+  "sourceVcs": {
+    "git": {
+      "sha1": "2976d90fd1c2db6b518700dd101b714069cfcb17"
+    },
+    "path_in_vcs": "rustls"
+  },
+  "changed": [
+    {
+      "path": "src/client/builder.rs",
+      "original": "aa2df5ce333599e3acd9cbf6f7758eb5444f6d9cf4b66c0a84130fc7e6a55f4b",
+      "patched": "e78179977a99b322794bed3fc1b76b1d45aca34e3f833350da6da155fac44b16"
+    },
+    {
+      "path": "src/client/client_conn.rs",
+      "original": "7cf3803f3b95e078743d687ab08b8c1d183c0c27a502a2a3d4403a512874b92d",
+      "patched": "ef9e8b66b12287c8b39574f3efa4156a971f0dc97d2bcb5fd54ba4a578776e0d"
+    },
+    {
+      "path": "src/client/hs.rs",
+      "original": "db78250533e2639401fa05a7e63ed2172aea9e38558a767deecf140dfbe03afe",
+      "patched": "4b0a77d1dacde68106e6b4c94063d7915f056b1215653c87bc6ccdb2a3d646de"
+    },
+    {
+      "path": "src/msgs/handshake.rs",
+      "original": "9f9d9d4686e4a3f4433edf5fcc17c224155fa3eef747363bfa53802fd67dda7d",
+      "patched": "4b5c9be7ae4c4fc000af503be9e4a8072e4bcc2de826965da1920a14bdf175bf"
+    }
+  ]
+}

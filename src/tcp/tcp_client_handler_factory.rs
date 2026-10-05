@@ -265,6 +265,8 @@ pub fn create_tcp_client_handler(
         }
         ClientProxyConfig::ShadowTls {
             password,
+            verify,
+            server_fingerprints,
             sni_hostname,
             protocol,
         } => {
@@ -276,14 +278,20 @@ pub fn create_tcp_client_handler(
                 None => "example.com".try_into().unwrap(), // Fallback
             };
 
-            // Create TLS config for ShadowTLS - must be TLS 1.3 only.
-            // ShadowTLS v3 requires TLS 1.3: we modify the ClientHello session_id to embed
-            // an HMAC tag, and rustls doesn't validate session_id echo for TLS 1.3 ServerHello.
-            // TLS 1.2 would fail anyway (no supported_versions extension), but restricting
-            // here provides defense in depth and fails fast at the TLS level.
+            let fingerprints = server_fingerprints.into_vec();
+            assert!(
+                verify || !fingerprints.is_empty(),
+                "ShadowTLS requires certificate verification or pins"
+            );
+            assert!(
+                !verify || enable_sni,
+                "ShadowTLS certificate verification requires SNI"
+            );
+            // The signed ClientHello enters rustls's transcript before TLS 1.3
+            // completes certificate, signature and Finished verification.
             let client_config = Arc::new(create_client_config(
-                false,      // No WebPKI verification needed for ShadowTLS
-                Vec::new(), // No fingerprints
+                verify,
+                fingerprints,
                 Vec::new(), // No ALPN
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert

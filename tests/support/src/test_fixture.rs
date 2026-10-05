@@ -3208,6 +3208,29 @@ impl ProxyTestFixture {
     /// Generate shoes config for all shoes proxies
     fn generate_shoes_configs(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut configs = Vec::new();
+        let mut shadowtls_certs = std::collections::HashMap::new();
+        let mut shadowtls_pins = std::collections::HashMap::new();
+        for proxy in &self.proxies {
+            if matches!(
+                proxy.proxy_type,
+                ProxyType::ShoesShadowTlsLocalServer { .. }
+            ) {
+                let (cert, key) = generate_test_cert()?;
+                let bytes = std::fs::read(AsRef::<Path>::as_ref(&cert))?;
+                let der = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
+                    .next()
+                    .ok_or("empty ShadowTLS fixture certificate")??;
+                let pin: String =
+                    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der.as_ref())
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                let address = (proxy.ip.clone(), proxy.port);
+                shadowtls_pins.insert(address.clone(), pin);
+                shadowtls_certs.insert(address, (cert, key));
+            }
+        }
 
         for proxy in &self.proxies {
             let config = match &proxy.proxy_type {
@@ -3652,7 +3675,9 @@ impl ProxyTestFixture {
                     ))
                 }
                 ProxyType::ShoesShadowTlsLocalServer { password } => {
-                    let (cert, key) = generate_test_cert()?;
+                    let (cert, key) = shadowtls_certs
+                        .remove(&(proxy.ip.clone(), proxy.port))
+                        .ok_or("missing ShadowTLS fixture certificate")?;
                     let cfg = format!(
                         r#"- address: "{}:{}"
   protocol:
@@ -3700,14 +3725,22 @@ impl ProxyTestFixture {
                     upstream_port,
                     password,
                     sni,
-                } => Some(format!(
-                    r#"- client_group: default
+                } => {
+                    let trust = match shadowtls_pins.get(&(upstream_ip.clone(), *upstream_port)) {
+                        Some(pin) => format!(
+                            "        verify: false\n        server_fingerprints: [\"{pin}\"]"
+                        ),
+                        None => "        verify: true".to_owned(),
+                    };
+                    Some(format!(
+                        r#"- client_group: default
   client_proxy:
     - address: "{}:{}"
       protocol:
         type: shadowtls
         password: "{}"
         sni_hostname: "{}"
+{}
         protocol:
           type: vless
           user_id: "{}"
@@ -3719,8 +3752,16 @@ impl ProxyTestFixture {
     mask: "0.0.0.0/0"
     action: allow
     client_proxy: default"#,
-                    upstream_ip, upstream_port, password, sni, TEST_UUID, proxy.ip, proxy.port
-                )),
+                        upstream_ip,
+                        upstream_port,
+                        password,
+                        sni,
+                        trust,
+                        TEST_UUID,
+                        proxy.ip,
+                        proxy.port
+                    ))
+                }
                 ProxyType::ShoesShadowsocksServer { cipher, password } => Some(format!(
                     r#"- address: "{}:{}"
   protocol:
