@@ -320,7 +320,7 @@ async fn system_roots_reject_untrusted_handshake_certificate() {
     let _server = start_shadowtls_server(server_port, &cert, &ss_key_b64).await;
     let (origin_port, origin_connections) = start_origin_echo_server().await;
 
-    // verify: true routes through WebPKI against the engine's root store,
+    // verify: true routes through the platform's certificate trust backend,
     // which cannot contain our self-signed test certificate.
     let chain = build_chain(server_port, &ss_key_b64, "  verify: true\n");
 
@@ -330,7 +330,8 @@ async fn system_roots_reject_untrusted_handshake_certificate() {
     );
 
     assert!(
-        err.to_string().contains("UnknownIssuer"),
+        err.kind() == std::io::ErrorKind::InvalidData
+            && err.to_string().contains("invalid peer certificate:"),
         "unexpected error: {err}"
     );
     assert!(
@@ -347,11 +348,10 @@ async fn system_roots_reject_untrusted_handshake_certificate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn system_roots_reject_wrong_name_certificate_before_traffic() {
     // The server target presents a certificate whose identity does not match
-    // the client's SNI. The certificate is also self-signed, so WebPKI
-    // rejects it at path validation (UnknownIssuer) before name validation;
-    // the name-validation-specific proof lives in the verifier-level unit
-    // tests (rustls_config_util::tests::webpki_branch_rejects_certificate_for_wrong_name),
-    // where a test CA can stand in for the system roots.
+    // the client's SNI. The certificate is also self-signed, so platform trust
+    // rejects it at path validation before name validation. The unit test
+    // shadowtls_platform_rejects_wrong_name_in_the_actual_trusted_flight
+    // isolates name validation with a controlled CA and an actual TLS flight.
     let cert = generate_handshake_cert("other.test");
     let ss_key_b64 = ss_key();
     let server_port = free_port();
@@ -366,7 +366,8 @@ async fn system_roots_reject_wrong_name_certificate_before_traffic() {
     );
 
     assert!(
-        err.to_string().contains("UnknownIssuer"),
+        err.kind() == std::io::ErrorKind::InvalidData
+            && err.to_string().contains("invalid peer certificate:"),
         "unexpected error: {err}"
     );
     assert!(
