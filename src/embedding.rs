@@ -36,9 +36,10 @@ pub trait ServerHooks: Send + Sync + Debug {
     ///
     /// AnyTLS sessions are reported with the client's identity. Connections
     /// the server forwards itself (for example Shadowsocks, including inside
-    /// ShadowTLS) are reported as [`SessionAuth::Listener`]. Sessions a handler
-    /// multiplexes on its own (for example Shadowsocks h2mux) are not reported;
-    /// their outbound destinations still go through [`Self::check_outbound`].
+    /// ShadowTLS) are reported as [`SessionAuth::Listener`], and so are
+    /// Shadowsocks h2mux sessions. Sessions other handlers multiplex on their
+    /// own (VMess, VLESS, Trojan, Snell h2mux) are not reported; their outbound
+    /// destinations still go through [`Self::check_outbound`].
     ///
     /// Return a [`SessionGrant`] to accept the session, or `None` to refuse it.
     /// A refused session is treated like one with an unknown password (for

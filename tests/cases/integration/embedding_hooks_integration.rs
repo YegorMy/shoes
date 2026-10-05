@@ -13,6 +13,7 @@ use std::time::Duration;
 use aws_lc_rs::digest::{SHA256, digest};
 use common::certs::generate_test_cert_files;
 use common::port_helper::PortHelper;
+use common::test_fixture::start_singbox_server;
 use parking_lot::Mutex;
 use shoes::config::{
     ClientChainHop, ClientConfig, Config, ConfigSelection, convert_cert_paths,
@@ -25,7 +26,7 @@ use shoes::resolver::{NativeResolver, Resolver};
 use shoes::tcp::chain_builder::build_client_proxy_chain;
 use shoes::{NetLocation, OneOrSome, ResolvedLocation};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -463,6 +464,111 @@ protocol:
     cancel.cancel();
     assert!(wait_closed(&mut stream).await, "cancelled session must end");
     assert!(echo.wait_all_closed().await);
+
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+/// SOCKS5 CONNECT (no auth) to an IPv4 target through a local SOCKS inbound.
+async fn socks5_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+    let SocketAddr::V4(target) = target else {
+        return Err(std::io::Error::other("IPv4 target required"));
+    };
+    let mut tcp = TcpStream::connect(socks).await?;
+    tcp.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method = [0u8; 2];
+    tcp.read_exact(&mut method).await?;
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&target.ip().octets());
+    request.extend_from_slice(&target.port().to_be_bytes());
+    tcp.write_all(&request).await?;
+    let mut reply = [0u8; 10];
+    tcp.read_exact(&mut reply).await?;
+    if reply[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 CONNECT failed: {}",
+            reply[1]
+        )));
+    }
+    Ok(tcp)
+}
+
+/// Whether `payload` comes back on `stream` within a second.
+async fn echoes(stream: &mut TcpStream, payload: &[u8]) -> bool {
+    if stream.write_all(payload).await.is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; payload.len()];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut buf)).await,
+        Ok(Ok(_)) if buf == payload
+    )
+}
+
+/// Shadowsocks h2mux sessions (sing-box client) go through `open_session`, and
+/// cancelling the grant ends the session together with its multiplexed streams.
+#[tokio::test]
+async fn test_shadowsocks_h2mux_sessions_are_granted_and_cancelled() -> TestResult {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut ports = PortHelper::new();
+    let echo = EchoServer::start().await?;
+
+    let (ip, port) = ports.get_localhost_listener_port();
+    let (socks_ip, socks_port) = ports.get_localhost_listener_port();
+    let hooks = Arc::new(TestHooks::default());
+    let server_yaml = format!(
+        r#"
+- address: "{ip}:{port}"
+  protocol:
+    type: shadowsocks
+    cipher: aes-256-gcm
+    password: "{LISTENER_PASSWORD}"
+"#
+    );
+    let handles = start_hooked_servers(&server_yaml, &resolver, hooks.clone()).await?;
+    let singbox_config = format!(
+        r#"{{
+  "log": {{ "level": "warn" }},
+  "inbounds": [{{ "type": "socks", "listen": "{socks_ip}", "listen_port": {socks_port} }}],
+  "outbounds": [{{
+    "type": "shadowsocks", "server": "{ip}", "server_port": {port},
+    "method": "aes-256-gcm", "password": "{LISTENER_PASSWORD}",
+    "multiplex": {{ "enabled": true, "protocol": "h2mux", "max_connections": 1, "min_streams": 1, "max_streams": 0 }}
+  }}]
+}}"#
+    );
+    let (_singbox, _singbox_config) = start_singbox_server(&singbox_config)?;
+    ports.wait_for_all_ports().await?;
+    let socks: SocketAddr = format!("{socks_ip}:{socks_port}").parse()?;
+
+    // Without a grant the multiplexed session is refused before any outbound connection.
+    if let Ok(mut refused) = socks5_connect(socks, echo.addr).await {
+        assert!(!echoes(&mut refused, b"refused").await);
+    }
+    assert_eq!(echo.accepted(), 0);
+    assert!(hooks.refused.load(Ordering::SeqCst) >= 1);
+
+    // With a grant it relays; cancelling the grant closes its outbound streams.
+    let cancel = CancellationToken::new();
+    *hooks.listener_session.lock() = Some(cancel.clone());
+    let mut relayed = false;
+    for _ in 0..20 {
+        if let Ok(mut stream) = socks5_connect(socks, echo.addr).await
+            && echoes(&mut stream, b"hello through a granted h2mux session").await
+        {
+            relayed = true;
+            cancel.cancel();
+            assert!(
+                echo.wait_all_closed().await,
+                "cancelled h2mux streams must end"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(relayed, "a granted h2mux session must relay");
 
     for handle in handles {
         handle.abort();

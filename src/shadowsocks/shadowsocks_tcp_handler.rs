@@ -12,6 +12,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::embedding::SessionAuth;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
@@ -184,16 +185,41 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
             let initial_data = stream_reader.unparsed_data_owned();
 
+            // With hooks installed, a multiplexed session is reported like any
+            // other listener session, and cancelling its grant ends it.
+            let grant = match proxy_selector.hooks() {
+                Some(hooks) => match hooks.open_session(SessionAuth::Listener {
+                    target: proxy_selector.target(),
+                }) {
+                    Some(grant) => Some(grant),
+                    None => {
+                        debug!("Shadowsocks h2mux session refused by embedder hooks");
+                        return Ok(TcpServerSetupResult::AlreadyHandled);
+                    }
+                },
+                None => None,
+            };
+
             tokio::spawn(async move {
-                if let Err(e) = handle_h2mux_session(
+                let session = handle_h2mux_session(
                     server_stream,
                     initial_data,
                     udp_enabled,
                     proxy_selector,
                     resolver,
-                )
-                .await
-                {
+                );
+                let result = match grant {
+                    Some(grant) => {
+                        let _done = grant.done_guard();
+                        tokio::select! {
+                            biased;
+                            () = grant.cancel_token().cancelled() => Ok(()),
+                            result = session => result,
+                        }
+                    }
+                    None => session.await,
+                };
+                if let Err(e) = result {
                     debug!("Shadowsocks h2mux session ended: {}", e);
                 }
             });
