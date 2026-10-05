@@ -19,6 +19,8 @@ use crate::resolver::Resolver;
 /// Like [`crate::tcp::tcp_server::start_servers`], with `hooks` installed on
 /// every listener the config starts. Hooks are supported for TCP transport
 /// servers; TUN and QUIC configs are refused with `ErrorKind::Unsupported`.
+/// TCP address listeners are bound before success returns; an address bind
+/// error releases the config's acquired sockets without launching its tasks.
 pub async fn start_servers_with_hooks(
     config: Config,
     resolver: Arc<dyn Resolver>,

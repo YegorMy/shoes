@@ -35,9 +35,17 @@ async fn run_tcp_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
-    let TcpConfig { no_delay } = tcp_config;
-
     let listener = new_tcp_listener(bind_address, 4096, None)?;
+    run_tcp_listener(listener, tcp_config, resolver, server_handler).await
+}
+
+async fn run_tcp_listener(
+    listener: tokio::net::TcpListener,
+    tcp_config: TcpConfig,
+    resolver: Arc<dyn Resolver>,
+    server_handler: Arc<dyn TcpServerHandler>,
+) -> std::io::Result<()> {
+    let TcpConfig { no_delay } = tcp_config;
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -490,6 +498,7 @@ async fn start_tcp_servers(
 
     let mut client_proxy_selector =
         create_tcp_client_proxy_selector(rules.clone(), resolver.clone());
+    let hooked = hooks.is_some();
     if let Some(hooks) = hooks {
         client_proxy_selector = client_proxy_selector.with_hooks(hooks);
     }
@@ -501,8 +510,8 @@ async fn start_tcp_servers(
         BindLocation::Address(addresses) => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
-            for address in addresses.into_vec() {
-                for socket_addr in address.to_socket_addrs()? {
+            let mut spawn_listener =
+                |socket_addr: SocketAddr, listener: Option<tokio::net::TcpListener>| {
                     let tcp_handler = handlers
                         .entry(socket_addr.ip())
                         .or_insert_with(|| {
@@ -520,11 +529,36 @@ async fn start_tcp_servers(
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
                     let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
-                            .await
-                            .unwrap();
+                        let result = match listener {
+                            Some(listener) => {
+                                run_tcp_listener(listener, tcp_config, resolver, tcp_handler).await
+                            }
+                            None => {
+                                run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler).await
+                            }
+                        };
+                        result.unwrap();
                     });
                     handles.push(handle);
+                };
+            if hooked {
+                // Own every address before any listener task starts. A later
+                // bind error drops earlier sockets with the temporary vector.
+                let mut listeners = Vec::new();
+                for address in addresses.into_vec() {
+                    for socket_addr in address.to_socket_addrs()? {
+                        listeners.push((socket_addr, new_tcp_listener(socket_addr, 4096, None)?));
+                    }
+                }
+                for (socket_addr, listener) in listeners {
+                    spawn_listener(socket_addr, Some(listener));
+                }
+            } else {
+                // Preserve ordinary startup's asynchronous bind and ordering.
+                for address in addresses.into_vec() {
+                    for socket_addr in address.to_socket_addrs()? {
+                        spawn_listener(socket_addr, None);
+                    }
                 }
             }
         }

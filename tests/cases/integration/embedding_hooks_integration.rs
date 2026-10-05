@@ -124,6 +124,84 @@ fn sha256(password: &str) -> [u8; 32] {
     hash
 }
 
+#[tokio::test]
+async fn embedding_hooks_occupied_address_returns_bind_error_before_success() -> TestResult {
+    let foreign = TcpListener::bind("127.0.0.1:0").await?;
+    let address = foreign.local_addr()?;
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let yaml = format!("- address: \"{address}\"\n  protocol:\n    type: socks\n");
+    let result = start_hooked_servers(&yaml, &resolver, Arc::new(TestHooks::default())).await;
+    let error = result.expect_err("a foreign listener cannot certify this engine's startup");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AddrInUse)
+    );
+    let connection = TcpStream::connect(address).await?;
+    let (accepted, _) = foreign.accept().await?;
+    drop((connection, accepted));
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedding_hooks_later_address_failure_releases_earlier_bound_socket() -> TestResult {
+    let available = TcpListener::bind("127.0.0.1:0").await?;
+    let first = available.local_addr()?;
+    let foreign = TcpListener::bind("127.0.0.1:0").await?;
+    let second = foreign.local_addr()?;
+    drop(available);
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let yaml = format!("- address: [\"{first}\", \"{second}\"]\n  protocol:\n    type: socks\n");
+    let result = start_hooked_servers(&yaml, &resolver, Arc::new(TestHooks::default())).await;
+    let error = result.expect_err("a later bind error cannot return partial successful startup");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AddrInUse)
+    );
+    let rebound = TcpListener::bind(first).await?;
+    assert_eq!(
+        rebound.local_addr()?,
+        first,
+        "the earlier acquired listener was released"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedding_hooks_success_owns_listener_before_return_and_releases_after_join() -> TestResult
+{
+    let reservation = TcpListener::bind("127.0.0.1:0").await?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let yaml = format!("- address: \"{address}\"\n  protocol:\n    type: socks\n");
+    let handles = start_hooked_servers(&yaml, &resolver, Arc::new(TestHooks::default())).await?;
+    assert_eq!(handles.len(), 1);
+    let error = TcpListener::bind(address)
+        .await
+        .expect_err("successful return owns the port already");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    // This is a real SOCKS negotiation serviced by the owned accept task.
+    let mut connection = TcpStream::connect(address).await?;
+    connection.write_all(&[5, 1, 0]).await?;
+    let mut reply = [0; 2];
+    tokio::time::timeout(Duration::from_secs(2), connection.read_exact(&mut reply)).await??;
+    assert_eq!(reply, [5, 0]);
+    drop(connection);
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+    let rebound = TcpListener::bind(address).await?;
+    assert_eq!(rebound.local_addr()?, address);
+    Ok(())
+}
+
 /// Echo server that counts accepted and still-open connections.
 struct EchoServer {
     addr: SocketAddr,
