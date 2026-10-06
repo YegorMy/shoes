@@ -194,4 +194,8 @@ impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}
+impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {
+    fn is_message_eof(&self) -> bool {
+        self.is_eof
+    }
+}

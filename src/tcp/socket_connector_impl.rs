@@ -3,16 +3,11 @@
 //! Handles TCP and QUIC transports with bind_interface support.
 //! Created from the socket-related fields of any ClientConfig.
 
-use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use log::{debug, error};
-use tokio::io::ReadBuf;
-use tokio::net::UdpSocket;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
@@ -24,6 +19,9 @@ use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
 
 use super::socket_connector::SocketConnector;
+
+mod unconnected_udp;
+use unconnected_udp::UnconnectedUdpSocket;
 
 const MAX_QUIC_ENDPOINTS: usize = 32;
 
@@ -341,88 +339,6 @@ impl SocketConnector for SocketConnectorImpl {
         self.bind_interface.as_deref()
     }
 }
-
-/// A UDP socket wrapper that tracks the destination and uses send_to/recv_from.
-/// Unlike a connected UDP socket, this accepts incoming packets from any source.
-struct UnconnectedUdpSocket {
-    socket: UdpSocket,
-    destination: SocketAddr,
-}
-
-impl UnconnectedUdpSocket {
-    fn new(socket: UdpSocket, destination: SocketAddr) -> Self {
-        Self {
-            socket,
-            destination,
-        }
-    }
-}
-
-impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
-    fn poll_read_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        match this.socket.poll_recv_from(cx, buf) {
-            Poll::Ready(Ok(addr)) => {
-                log::debug!(
-                    "[UnconnectedUdp] Received {} bytes from {} (target: {})",
-                    buf.filled().len(),
-                    addr,
-                    this.destination
-                );
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl crate::async_stream::AsyncWriteMessage for UnconnectedUdpSocket {
-    fn poll_write_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        this.socket
-            .poll_send_to(cx, buf, this.destination)
-            .map(|r| r.map(|_| ()))
-    }
-}
-
-impl crate::async_stream::AsyncFlushMessage for UnconnectedUdpSocket {
-    fn poll_flush_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl crate::async_stream::AsyncShutdownMessage for UnconnectedUdpSocket {
-    fn poll_shutdown_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
-    fn supports_ping(&self) -> bool {
-        false
-    }
-
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        Poll::Ready(Ok(false))
-    }
-}
-
-impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 
 #[cfg(test)]
 mod tests {

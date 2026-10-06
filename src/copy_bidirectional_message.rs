@@ -18,8 +18,9 @@ struct CopyBuffer {
     need_flush: bool,
     need_write_ping: bool,
     cache_length: usize,
+    has_message: bool,
     buf: Box<[u8]>,
-    read_count: usize,
+    message_count: usize,
 }
 
 impl CopyBuffer {
@@ -29,8 +30,9 @@ impl CopyBuffer {
             need_flush,
             need_write_ping: false,
             cache_length: 0,
+            has_message: false,
             buf: allocate_vec(65535).into_boxed_slice(),
-            read_count: 0,
+            message_count: 0,
         }
     }
 
@@ -53,19 +55,20 @@ impl CopyBuffer {
             let mut read_pending = false;
             let mut write_pending = false;
 
-            if !self.read_done && self.cache_length == 0 {
+            if !self.read_done && !self.has_message {
                 let me = &mut *self;
                 let mut buf = ReadBuf::new(&mut me.buf);
                 match reader.as_mut().poll_read_message(cx, &mut buf) {
                     Poll::Ready(val) => {
                         val?;
                         let n = buf.filled().len();
-                        if n == 0 {
+                        if n == 0 && reader.is_message_eof() {
                             self.read_done = true;
                         } else {
                             self.cache_length = n;
+                            self.has_message = true;
                             did_read = true;
-                            self.read_count = self.read_count.wrapping_add(n);
+                            self.message_count = self.message_count.wrapping_add(1);
                             coop.made_progress();
                         }
                     }
@@ -75,7 +78,7 @@ impl CopyBuffer {
                 }
             }
 
-            if self.cache_length > 0 {
+            if self.has_message {
                 let me = &mut *self;
                 match writer
                     .as_mut()
@@ -84,6 +87,7 @@ impl CopyBuffer {
                     Poll::Ready(val) => {
                         val?;
                         self.cache_length = 0;
+                        self.has_message = false;
                         self.need_flush = true;
                         // Don't bother writing ping, since we just wrote.
                         self.need_write_ping = false;
@@ -124,7 +128,7 @@ impl CopyBuffer {
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
-            if self.read_done && self.cache_length == 0 {
+            if self.read_done && !self.has_message {
                 return Poll::Ready(Ok(()));
             }
 
@@ -212,13 +216,13 @@ where
                 .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
         }
 
-        let a_count = a_buf.read_count;
-        let b_count = b_buf.read_count;
+        let a_count = a_buf.message_count;
+        let b_count = b_buf.message_count;
 
         let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
         let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        if a_buf.read_count != a_count || b_buf.read_count != b_count {
+        if a_buf.message_count != a_count || b_buf.message_count != b_count {
             *last_active = Instant::now();
         } else if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
             return Poll::Ready(Ok(()));
@@ -290,3 +294,6 @@ where
     }
     .await
 }
+
+#[cfg(test)]
+mod tests;

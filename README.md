@@ -50,6 +50,22 @@ All server protocols plus:
 
 For advanced access control (IP allowlist/blocklists), see [tobaru](https://github.com/cfal/tobaru).
 
+### Embedded message reads
+
+After a successful `AsyncReadMessage::poll_read_message` with an empty payload,
+call `AsyncMessageStream::is_message_eof()` to distinguish a datagram from EOF.
+UoT V2/VLESS framing reports EOF only after the underlying stream ends; a decoded
+length-zero frame is a valid datagram. Native connected and unconnected UDP
+sockets never report message EOF. Boxed and borrowed message streams forward the
+underlying state. Other implementations retain their legacy zero-length EOF
+convention through the default method and must override it if they carry empty
+datagrams. Do not consult this state after a pending or failed read.
+
+The bidirectional message relay preserves empty packets, including a write that
+parks before accepting the packet, and treats them as activity. Partial-frame
+EOF remains an IO error. The method does not change framing or provide a timeout
+or cancellation guarantee for native certificate verification.
+
 ## Installation
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
