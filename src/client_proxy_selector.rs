@@ -524,10 +524,7 @@ async fn match_rule(
             {
                 Ok(is_match) => {
                     if is_match {
-                        debug!(
-                            "Found matching mask for {} -> {mask:?}",
-                            location.location()
-                        );
+                        debug!("Found matching routing rule");
                         return Ok(Some(rule_index));
                     }
                 }
@@ -539,8 +536,8 @@ async fn match_rule(
                 }
                 Err(MatchMaskError::NonFatal(e)) => {
                     error!(
-                        "Non-fatal error while trying to match mask for {}: {e}",
-                        location.location()
+                        "Non-fatal error while trying to match routing rule (kind={:?})",
+                        e.kind()
                     );
                 }
             }

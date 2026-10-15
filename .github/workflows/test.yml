@@ -50,6 +50,9 @@ jobs:
     - name: Run local tests
       run: cargo test --workspace --locked --lib --bins --verbose
 
+    - name: Check listener log privacy
+      run: cargo test --locked --test listener_logging --verbose
+
   integration-tests:
     name: Integration (${{ matrix.name }})
     needs: unit-tests

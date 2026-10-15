@@ -150,7 +150,8 @@ async fn start_tcp_servers(
                             .into()
                         })
                         .clone();
-                    debug!("TCP handler for {}: {tcp_handler:?}", socket_addr.ip());
+                    // Handler Debug output can include credentials and routing targets.
+                    debug!("TCP handler initialized");
 
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
@@ -194,7 +195,7 @@ async fn start_tcp_servers(
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
-                debug!("TCP handler: {tcp_handler:?}");
+                debug!("Unix handler initialized");
                 let handle = tokio::spawn(async move {
                     run_unix_server(path_buf, resolver, tcp_handler)
                         .await

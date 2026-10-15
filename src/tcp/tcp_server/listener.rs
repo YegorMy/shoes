@@ -28,10 +28,10 @@ pub(super) async fn run_tcp_listener(
     let TcpConfig { no_delay } = tcp_config;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {e}");
+                error!("TCP accept failed (kind={:?})", e.kind());
                 continue;
             }
         };
@@ -41,20 +41,23 @@ pub(super) async fn run_tcp_listener(
             std::time::Duration::from_secs(300),
             std::time::Duration::from_secs(60),
         ) {
-            error!("Failed to set TCP keepalive: {e}");
+            error!("Failed to set TCP keepalive (kind={:?})", e.kind());
         }
 
         if no_delay && let Err(e) = stream.set_nodelay(true) {
-            error!("Failed to set TCP nodelay: {e}");
+            error!("Failed to set TCP nodelay (kind={:?})", e.kind());
         }
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                // Protocol and resolver errors can contain destinations, queried
+                // names, credentials or payloads. Log only the bounded category,
+                // never the peer or an arbitrary error's Display/Debug text.
+                error!("TCP connection finished with error (kind={:?})", e.kind());
             } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                debug!("TCP connection finished successfully");
             }
         });
     }
@@ -77,10 +80,10 @@ pub(super) async fn run_unix_server(
     let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {e:?}");
+                error!("Unix accept failed (kind={:?})", e.kind());
                 continue;
             }
         };
@@ -89,9 +92,9 @@ pub(super) async fn run_unix_server(
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{addr:?} finished with error: {e:?}");
+                error!("Unix connection finished with error (kind={:?})", e.kind());
             } else {
-                debug!("{addr:?} finished successfully");
+                debug!("Unix connection finished successfully");
             }
         });
     }
