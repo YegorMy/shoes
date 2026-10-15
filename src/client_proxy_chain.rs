@@ -251,9 +251,8 @@ impl ClientProxyChain {
         let subsequent_proxies = self.select_subsequent_proxies();
 
         debug!(
-            "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
-            subsequent_proxies.len(),
-            remote_location.location()
+            "Chain TCP connect: 1 initial + {} subsequent hop(s)",
+            subsequent_proxies.len()
         );
 
         // Determine first target after initial hop (proxy locations need wrapping)
@@ -266,10 +265,7 @@ impl ClientProxyChain {
         let mut result = match entry {
             InitialHopEntry::Direct(socket) => {
                 // Socket connects to first subsequent proxy (or final target)
-                debug!(
-                    "Initial hop: Direct -> {}",
-                    first_subsequent_target.location()
-                );
+                debug!("Initial hop: Direct");
                 let stream = socket.connect(resolver, &first_subsequent_target).await?;
                 TcpClientSetupResult {
                     client_stream: stream,
@@ -278,11 +274,7 @@ impl ClientProxyChain {
             }
             InitialHopEntry::Proxy { socket, proxy } => {
                 // Socket connects to this proxy's location
-                debug!(
-                    "Initial hop: Proxy {} -> {}",
-                    proxy.proxy_location(),
-                    first_subsequent_target.location()
-                );
+                debug!("Initial hop: Proxy");
                 let proxy_loc = proxy.proxy_location().into();
                 let stream = socket.connect(resolver, &proxy_loc).await?;
                 // Protocol setup targeting first subsequent proxy (or final target)
@@ -299,13 +291,7 @@ impl ClientProxyChain {
                 .map(|p| p.proxy_location().into())
                 .unwrap_or_else(|| remote_location.clone());
 
-            debug!(
-                "Subsequent hop {}/{}: {} -> {}",
-                i + 1,
-                subsequent_proxies.len(),
-                proxy.proxy_location(),
-                target.location()
-            );
+            debug!("Subsequent hop {}/{}", i + 1, subsequent_proxies.len());
 
             result = proxy
                 .setup_tcp_stream(result.client_stream, &target)
@@ -327,9 +313,8 @@ impl ClientProxyChain {
         }
 
         debug!(
-            "Chain TCP complete: {} total hop(s) to {}",
-            1 + subsequent_proxies.len(),
-            remote_location.location()
+            "Chain TCP complete: {} total hop(s)",
+            1 + subsequent_proxies.len()
         );
 
         Ok(result)

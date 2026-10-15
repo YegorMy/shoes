@@ -40,10 +40,10 @@ async fn run_tcp_server(
     let listener = new_tcp_listener(bind_address, 4096, None)?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {e}");
+                error!("TCP accept failed (kind={:?})", e.kind());
                 continue;
             }
         };
@@ -53,20 +53,23 @@ async fn run_tcp_server(
             std::time::Duration::from_secs(300),
             std::time::Duration::from_secs(60),
         ) {
-            error!("Failed to set TCP keepalive: {e}");
+            error!("Failed to set TCP keepalive (kind={:?})", e.kind());
         }
 
         if no_delay && let Err(e) = stream.set_nodelay(true) {
-            error!("Failed to set TCP nodelay: {e}");
+            error!("Failed to set TCP nodelay (kind={:?})", e.kind());
         }
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                // Protocol and resolver errors can contain destinations, queried
+                // names, credentials or payloads. Log only the bounded category,
+                // never the peer or an arbitrary error's Display/Debug text.
+                error!("TCP connection finished with error (kind={:?})", e.kind());
             } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                debug!("TCP connection finished successfully");
             }
         });
     }
@@ -89,10 +92,10 @@ async fn run_unix_server(
     let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {e:?}");
+                error!("Unix accept failed (kind={:?})", e.kind());
                 continue;
             }
         };
@@ -101,9 +104,9 @@ async fn run_unix_server(
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{addr:?} finished with error: {e:?}");
+                error!("Unix connection finished with error (kind={:?})", e.kind());
             } else {
-                debug!("{addr:?} finished successfully");
+                debug!("Unix connection finished successfully");
             }
         });
     }
@@ -515,7 +518,8 @@ async fn start_tcp_servers(
                             .into()
                         })
                         .clone();
-                    debug!("TCP handler for {}: {tcp_handler:?}", socket_addr.ip());
+                    // Handler Debug output can include credentials and routing targets.
+                    debug!("TCP handler initialized");
 
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
@@ -534,7 +538,7 @@ async fn start_tcp_servers(
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
-                debug!("TCP handler: {tcp_handler:?}");
+                debug!("Unix handler initialized");
                 let handle = tokio::spawn(async move {
                     run_unix_server(path_buf, resolver, tcp_handler)
                         .await

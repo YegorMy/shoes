@@ -229,25 +229,22 @@ impl SocketConnector for SocketConnectorImpl {
                     match tcp_socket.connect(*target_addr).await {
                         Ok(stream) => {
                             if i > 0 {
-                                debug!(
-                                    "TCP connect succeeded on address #{} ({}) after {} failures",
-                                    i, target_addr, i
-                                );
+                                debug!("TCP connect succeeded after {} failures", i);
                             }
                             if let Err(e) = set_tcp_keepalive(
                                 &stream,
                                 std::time::Duration::from_secs(120),
                                 std::time::Duration::from_secs(30),
                             ) {
-                                error!("Failed to set TCP keepalive: {e}");
+                                error!("Failed to set TCP keepalive (kind={:?})", e.kind());
                             }
                             if *no_delay && let Err(e) = stream.set_nodelay(true) {
-                                error!("Failed to set TCP no-delay: {e}");
+                                error!("Failed to set TCP no-delay (kind={:?})", e.kind());
                             }
                             return Ok(Box::new(stream));
                         }
                         Err(e) => {
-                            debug!("TCP connect to {} failed: {}, trying next", target_addr, e);
+                            debug!("TCP connect failed (kind={:?}), trying next", e.kind());
                             last_err = Some(e);
                         }
                     }
