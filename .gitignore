@@ -2,3 +2,11 @@
 /output
 /*.yaml
 *.pem
+
+# Private Hive coordination, execution receipts and caches are not source.
+/.hive-workspace/
+/.hive-worktrees/
+/.hive/tmp/
+/.hive/index/
+/.hive/guard/
+/graphify-out/
