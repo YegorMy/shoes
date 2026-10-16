@@ -570,7 +570,7 @@ mod client_hello {
 
         let client_hello_hash = transcript.hash_given(&[]);
 
-        trace!("sending server hello {sh:?}");
+        trace!("sending server hello");
         transcript.add_message(&sh);
         cx.common.send_msg(sh, false);
 
@@ -639,7 +639,7 @@ mod client_hello {
             )),
         };
 
-        trace!("Requesting retry {m:?}");
+        trace!("requesting hello retry");
         transcript.rollup_for_hrr();
         transcript.add_message(&m);
         common.send_msg(m, false);
@@ -732,7 +732,7 @@ mod client_hello {
 
         let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));
 
-        trace!("sending encrypted extensions {ee:?}");
+        trace!("sending encrypted extensions");
         flight.add(ee);
         Ok(early_data)
     }
@@ -771,7 +771,7 @@ mod client_hello {
 
         let creq = HandshakeMessagePayload(HandshakePayload::CertificateRequestTls13(cr));
 
-        trace!("Sending CertificateRequest {creq:?}");
+        trace!("sending certificate request");
         flight.add(creq);
         Ok(true)
     }
@@ -785,7 +785,7 @@ mod client_hello {
             CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response),
         ));
 
-        trace!("sending certificate {cert:?}");
+        trace!("sending certificate");
         flight.add(cert);
     }
 
@@ -809,7 +809,7 @@ mod client_hello {
             entry.compressed_cert_payload(),
         ));
 
-        trace!("sending compressed certificate {c:?}");
+        trace!("sending compressed certificate");
         flight.add(c);
     }
 
@@ -837,7 +837,7 @@ mod client_hello {
 
         let cv = HandshakeMessagePayload(HandshakePayload::CertificateVerify(cv));
 
-        trace!("sending certificate-verify {cv:?}");
+        trace!("sending certificate verify");
         flight.add(cv);
         Ok(())
     }
@@ -855,7 +855,7 @@ mod client_hello {
 
         let fin = HandshakeMessagePayload(HandshakePayload::Finished(verify_data_payload));
 
-        trace!("sending finished {fin:?}");
+        trace!("sending finished");
         flight.add(fin);
         let hash_at_server_fin = flight.transcript.current_hash();
         flight.finish(cx.common);
@@ -1351,7 +1351,7 @@ impl ExpectFinished {
         }
 
         let t = HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(payload));
-        trace!("sending new ticket {t:?} (stateless: {stateless})");
+        trace!("sending new ticket (stateless: {stateless})");
         flight.add(t);
 
         Ok(())

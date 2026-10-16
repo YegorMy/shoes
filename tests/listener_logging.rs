@@ -1,5 +1,8 @@
 //! Local, in-process listener regression with an unfiltered live log collector.
 //! A separate test binary keeps the process-global logger isolated from other suites.
+#[path = "listener_logging/tls.rs"]
+mod tls;
+
 use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;

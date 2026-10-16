@@ -190,10 +190,7 @@ async fn shadowtls_fallback_to_handshake_server(
     client_chain: &ClientProxyChain,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<TcpServerSetupResult> {
-    log::debug!(
-        "SHADOWTLS FALLBACK: Connecting to handshake server: {}",
-        location
-    );
+    log::debug!("SHADOWTLS FALLBACK: Connecting to handshake server");
 
     let TcpClientSetupResult {
         client_stream: mut handshake_stream,
@@ -240,7 +237,7 @@ async fn shadowtls_fallback_to_handshake_server(
         let _ = handshake_stream.shutdown().await;
 
         if let Err(e) = result {
-            log::debug!("SHADOWTLS FALLBACK: Connection ended: {}", e);
+            log::debug!("SHADOWTLS FALLBACK: Connection ended (kind={:?})", e.kind());
         } else {
             log::debug!("SHADOWTLS FALLBACK: Connection completed");
         }
@@ -266,9 +263,8 @@ pub async fn setup_shadowtls_server_stream(
             } = target.handshake
             {
                 log::warn!(
-                    "ShadowTLS authentication failed, falling back to handshake server: {} - reason: {}",
-                    location,
-                    e
+                    "ShadowTLS authentication failed, falling back to handshake server (kind={:?})",
+                    e.kind()
                 );
                 return shadowtls_fallback_to_handshake_server(
                     server_stream,

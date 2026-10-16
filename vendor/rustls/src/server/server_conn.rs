@@ -1047,7 +1047,7 @@ impl Accepted {
             named_groups: payload.named_groups.as_deref(),
         };
 
-        trace!("Accepted::client_hello(): {ch:#?}");
+        trace!("Accepted::client_hello() available");
         ch
     }
 

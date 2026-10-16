@@ -107,7 +107,7 @@ impl ExtensionProcessing {
                 })
                 .map(|bytes| ProtocolName::from(bytes.clone()));
             if let Some(selected_protocol) = &cx.common.alpn_protocol {
-                debug!("Chosen ALPN protocol {selected_protocol:?}");
+                debug!("ALPN protocol selected");
 
                 self.extensions.selected_protocol =
                     Some(SingleProtocolName::new(selected_protocol.clone()));
@@ -439,7 +439,7 @@ impl ExpectClientHello {
                 certificate_authorities,
                 named_groups: client_hello.named_groups.as_deref(),
             };
-            trace!("Resolving server certificate: {client_hello:#?}");
+            trace!("Resolving server certificate");
 
             let certkey = self
                 .config
@@ -715,7 +715,9 @@ pub(super) fn process_client_hello<'m>(
 ) -> Result<(&'m ClientHelloPayload, Vec<SignatureScheme>), Error> {
     let client_hello =
         require_handshake_msg!(m, HandshakeType::ClientHello, HandshakePayload::ClientHello)?;
-    trace!("we got a clienthello {client_hello:?}");
+    // ClientHello contains SNI, session identifiers and key shares. Diagnostics
+    // must describe progress, never serialize handshake or application data.
+    trace!("received client hello");
 
     if !client_hello
         .compression_methods

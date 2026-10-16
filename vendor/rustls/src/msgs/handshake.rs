@@ -1,7 +1,5 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
-#[cfg(feature = "logging")]
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
@@ -347,17 +345,12 @@ impl<'a> Codec<'a> for ServerNamePayload<'a> {
                 }
 
                 HostNamePayload::IpAddress(_invalid) => {
-                    warn!(
-                        "Illegal SNI extension: ignoring IP address presented as hostname ({_invalid:?})"
-                    );
+                    warn!("Illegal SNI extension: ignoring IP address presented as hostname");
                     Some(Self::IpAddress)
                 }
 
                 HostNamePayload::Invalid(_invalid) => {
-                    warn!(
-                        "Illegal SNI hostname received {:?}",
-                        String::from_utf8_lossy(&_invalid.0)
-                    );
+                    warn!("Illegal SNI hostname received");
                     Some(Self::Invalid)
                 }
             };

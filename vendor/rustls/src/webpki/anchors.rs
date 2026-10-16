@@ -43,9 +43,9 @@ impl RootCertStore {
                     self.roots.push(anchor.to_owned());
                     valid_count += 1;
                 }
-                Err(err) => {
-                    trace!("invalid cert der {:?}", der_cert.as_ref());
-                    debug!("certificate parsing failed: {err:?}");
+                Err(_err) => {
+                    trace!("invalid trust anchor certificate");
+                    debug!("certificate parsing failed");
                     invalid_count += 1;
                 }
             };

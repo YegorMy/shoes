@@ -268,7 +268,7 @@ async fn read_and_process_data(
     // Process the new data to advance the state machine
     // This is called after every feed, just like tokio-rustls does
     connection.process_new_packets().map_err(|e| {
-        log::error!("TLS error processing packets: {}", e);
+        log::error!("TLS error processing packets (kind={:?})", e.kind());
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TLS error: {}", e))
     })?;
 
