@@ -16,12 +16,7 @@ async fn test_xudp_accepts_response_from_alternate_source() -> Result<(), Box<dy
     let (shoes_ip, shoes_port) = ports.get_listener_port();
     let (singbox_ip, singbox_port) = ports.get_listener_port();
     let (primary_ip, primary_port) = ports.get_port();
-    let (response_ip, response_port) = loop {
-        let candidate = ports.get_port();
-        if candidate.0 != primary_ip {
-            break candidate;
-        }
-    };
+    let (response_ip, response_port) = ports.get_port_on_different_ip(&primary_ip)?;
     let primary_address: SocketAddr = format!("{primary_ip}:{primary_port}").parse()?;
     let (echo_server, response_address) = start_udp_asymmetric_echo_server(
         &primary_ip,

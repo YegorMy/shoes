@@ -69,12 +69,14 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         panic!("Cannot support reuse sockets");
     }
 
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
+    }
 
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    // This should be handled during config validation.
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    if bind_interface.is_some() {
         panic!("Could not bind to device, unsupported platform.")
     }
 
@@ -165,12 +167,14 @@ pub fn new_tcp_listener(
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
 
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
+    }
 
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    // This should be handled during config validation.
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    if bind_interface.is_some() {
         panic!("Could not bind to device, unsupported platform.")
     }
 

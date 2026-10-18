@@ -832,8 +832,14 @@ mod tests {
     #[tokio::test]
     async fn asymmetric_udp_echo_uses_the_response_socket() -> Result<(), Box<dyn std::error::Error>>
     {
+        let response_ip = if cfg!(target_vendor = "apple") {
+            "127.0.0.1"
+        } else {
+            "127.0.0.2"
+        };
         let (server, response_address) =
-            start_udp_asymmetric_echo_server("127.0.0.1", 0, "127.0.0.2", 0, b" response").await?;
+            start_udp_asymmetric_echo_server("127.0.0.1", 0, response_ip, 0, b" response").await?;
+        assert_ne!(server.local_addr(), response_address);
         let client = UdpSocket::bind("127.0.0.1:0").await?;
         client.send_to(b"request", server.local_addr()).await?;
 

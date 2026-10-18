@@ -378,7 +378,12 @@ async fn listener_logs_omit_sensitive_values() {
     // Unix listeners share process_stream and can leak the same nested errors.
     #[cfg(unix)]
     {
-        let dir = tempfile::tempdir_in(".").unwrap();
+        // Keep the owned socket path short regardless of worktree or TMPDIR length.
+        let dir = tempfile::Builder::new()
+            .prefix("shoes-listener-")
+            .rand_bytes(8)
+            .tempdir_in("/tmp")
+            .unwrap();
         let path = dir.path().join("listener.sock");
         let config = listener_config(&format!("path: '{}'", path.display()));
         tasks.0.extend(

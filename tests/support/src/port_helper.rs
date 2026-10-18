@@ -3,7 +3,9 @@
 //! Provides centralized port allocation with tracking and synchronization.
 //! All tests should use PortHelper instead of directly allocating ports.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::sync::{LazyLock, Mutex};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
@@ -21,7 +23,7 @@ impl PortHelper {
     }
 
     /// Get a random available address (IP, port) for a listening server.
-    /// Returns (IP as String, port) where IP is in range 127.0.0.1-127.0.0.255.
+    /// Uses kernel-selected localhost ports on Darwin and random 127/8 IPs elsewhere.
     /// This address will be tracked and waited for in wait_for_all_ports().
     pub fn get_listener_port(&mut self) -> (String, u16) {
         let (ip, port) = get_random_addr();
@@ -34,6 +36,11 @@ impl PortHelper {
     /// This address will NOT be tracked (clients don't listen).
     pub fn get_port(&mut self) -> (String, u16) {
         get_random_addr()
+    }
+
+    /// Require a distinct local source IP without unbounded allocation retries.
+    pub fn get_port_on_different_ip(&mut self, primary_ip: &str) -> std::io::Result<(String, u16)> {
+        select_distinct_source(primary_ip, || self.get_port())
     }
 
     /// Get a random available address for a QUIC/UDP listener.
@@ -52,24 +59,13 @@ impl PortHelper {
     ///
     /// Returns ("127.0.0.1", port).
     pub fn get_localhost_listener_port(&mut self) -> (String, u16) {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("failed to allocate a localhost test port");
-        let port = listener
-            .local_addr()
-            .expect("failed to read allocated localhost test port")
-            .port();
-        let addr = ("127.0.0.1".to_string(), port);
-        self.listener_addrs
-            .push(format!("{}:{}", addr.0, addr.1).parse().unwrap());
-        addr
+        let address = allocate_addr(|| Ipv4Addr::LOCALHOST.into());
+        self.listener_addrs.push(address);
+        (address.ip().to_string(), address.port())
     }
 
     pub fn get_ipv6_listener_port(&mut self) -> (String, u16) {
-        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
-            .expect("failed to allocate an IPv6 test port");
-        let address = listener
-            .local_addr()
-            .expect("failed to read the allocated IPv6 test port");
+        let address = allocate_addr(|| Ipv6Addr::LOCALHOST.into());
         self.listener_addrs.push(address);
         (address.ip().to_string(), address.port())
     }
@@ -96,43 +92,72 @@ impl PortHelper {
     }
 }
 
-/// Get a random available address (IP, port) by generating random IP in 127.0.0.1-255 range
-/// and random port. This dramatically reduces collision probability in parallel test execution
-/// by expanding the address space.
-fn get_random_addr() -> (String, u16) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
+static ALLOCATED_ENDPOINTS: LazyLock<Mutex<HashSet<SocketAddr>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
-    for _ in 0..10 {
-        // Generate random IP in 127.0.0.1-255 range
-        let ip_suffix1: u8 = rng.random_range(0..=255);
-        let ip_suffix2: u8 = rng.random_range(0..=255);
-        let ip_suffix3: u8 = rng.random_range(1..=255);
-        let ip = Ipv4Addr::new(127, ip_suffix1, ip_suffix2, ip_suffix3);
-        if ip == Ipv4Addr::LOCALHOST {
-            // don't use localhost since it might be used up
-            continue;
-        }
-
+/// Probe TCP and UDP together and never reissue an endpoint within this process.
+fn allocate_addr(mut choose_ip: impl FnMut() -> IpAddr) -> SocketAddr {
+    let mut allocated = ALLOCATED_ENDPOINTS.lock().unwrap();
+    for _ in 0..128 {
+        let ip = choose_ip();
         if let Ok(listener) = TcpListener::bind((ip, 0)) {
-            let port = listener.local_addr().unwrap().port();
-            if UdpSocket::bind((ip, port)).is_ok() {
-                return (ip.to_string(), port);
+            let address = listener.local_addr().unwrap();
+            if !allocated.contains(&address) && UdpSocket::bind(address).is_ok() {
+                allocated.insert(address);
+                return address;
             }
         }
     }
+    panic!("failed to allocate a fresh TCP/UDP loopback endpoint after 128 probes");
+}
 
-    unreachable!();
+fn get_random_addr() -> (String, u16) {
+    #[cfg(target_vendor = "apple")]
+    let address = allocate_addr(|| Ipv4Addr::LOCALHOST.into());
+    #[cfg(not(target_vendor = "apple"))]
+    let address = {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        allocate_addr(|| {
+            loop {
+                let ip = Ipv4Addr::new(
+                    127,
+                    rng.random_range(0..=255),
+                    rng.random_range(0..=255),
+                    rng.random_range(1..=255),
+                );
+                if ip != Ipv4Addr::LOCALHOST {
+                    break ip.into();
+                }
+            }
+        })
+    };
+    (address.ip().to_string(), address.port())
 }
 
 fn get_random_udp_addr() -> (String, u16) {
-    let (ip, _) = get_random_addr();
-    let socket = UdpSocket::bind(format!("{ip}:0")).expect("failed to allocate a UDP test port");
-    let port = socket
-        .local_addr()
-        .expect("failed to read allocated UDP test port")
-        .port();
-    (ip, port)
+    get_random_addr()
+}
+
+fn select_distinct_source(
+    primary_ip: &str,
+    mut allocate: impl FnMut() -> (String, u16),
+) -> std::io::Result<(String, u16)> {
+    for _ in 0..32 {
+        let candidate = allocate();
+        if candidate.0 != primary_ip {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        format!(
+            "Unavailable prerequisite: alternate-source XUDP coverage requires two distinct \
+             bindable local IPv4 addresses; the loopback allocator returned only {primary_ip} \
+             in 32 attempts. Run this coverage on a host with distinct local loopback addresses \
+             and the checksum-pinned sing-box peer; a different port on the same IP is insufficient."
+        ),
+    ))
 }
 
 /// Wait for an address (IP, port) to be ready for connections by attempting TCP connections.
@@ -166,6 +191,79 @@ async fn wait_for_addr(addr: SocketAddr, wait_timeout: Duration) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_source_selection_fails_after_bounded_attempts() {
+        let mut attempts = 0;
+        let error = select_distinct_source("127.0.0.1", || {
+            attempts += 1;
+            ("127.0.0.1".to_string(), 12345)
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 32);
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert!(error.to_string().contains("Unavailable prerequisite"));
+    }
+
+    #[test]
+    fn distinct_source_selection_preserves_alternate_ip() {
+        let mut attempts = 0;
+        let selected = select_distinct_source("127.0.0.1", || {
+            attempts += 1;
+            let ip = if attempts == 1 {
+                "127.0.0.1"
+            } else {
+                "127.0.0.2"
+            };
+            (ip.to_string(), 12345)
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(selected, ("127.0.0.2".to_string(), 12345));
+    }
+
+    #[test]
+    fn allocated_endpoints_support_tcp_and_udp() {
+        let mut listeners = Vec::new();
+        let mut sockets = Vec::new();
+        for _ in 0..32 {
+            let (ip, port) = get_random_addr();
+            let addr = SocketAddr::new(ip.parse().unwrap(), port);
+            assert!(addr.ip().is_loopback());
+            assert_ne!(port, 0);
+            #[cfg(target_vendor = "apple")]
+            assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
+            listeners.push(TcpListener::bind(addr).unwrap());
+            sockets.push(UdpSocket::bind(addr).unwrap());
+        }
+    }
+
+    #[test]
+    fn concurrent_allocations_are_distinct_before_callers_bind() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..32)
+                        .map(|_| {
+                            let (ip, port) = get_random_addr();
+                            SocketAddr::new(ip.parse().unwrap(), port)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let addresses: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(addresses.iter().copied().collect::<HashSet<_>>().len(), 256);
+        let mut listeners = Vec::new();
+        let mut sockets = Vec::new();
+        for address in addresses {
+            listeners.push(TcpListener::bind(address).unwrap());
+            sockets.push(UdpSocket::bind(address).unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn readiness_only_waits_for_pending_listeners() {

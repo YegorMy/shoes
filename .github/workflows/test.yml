@@ -51,7 +51,17 @@ jobs:
       run: cargo test --workspace --locked --lib --bins --verbose
 
     - name: Check listener log privacy
-      run: cargo test --locked --test listener_logging --verbose
+      env:
+        SHOES_TLS_PRIVACY_CAPTURE_DIR: ${{ runner.temp }}/shoes-tls-privacy-captures
+      run: cargo test --locked --test listener_logging --verbose -- --nocapture
+
+    - name: Retain complete DEBUG and TRACE privacy captures
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: listener-tls-privacy-captures
+        path: ${{ runner.temp }}/shoes-tls-privacy-captures
+        if-no-files-found: error
 
   integration-tests:
     name: Integration (${{ matrix.name }})
@@ -155,3 +165,25 @@ jobs:
               --verbose "$filter::" -- --test-threads=1
           done
         fi
+
+  shadowtls-independent-peer:
+    name: ShadowTLS pinned independent peer
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check Docker prerequisite
+      run: docker info
+
+    - name: Verify real ShadowTLS flights and pinned peer
+      run: >-
+        cargo test -p shoes --locked --features optional-peer-tests
+        --test integration --verbose shadowtls_cert_verification::
+        -- --nocapture --test-threads=1
