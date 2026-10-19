@@ -424,7 +424,7 @@ pub(super) fn is_pem_file_path(s: &str) -> bool {
 }
 
 async fn read_pem_to_string(path: &str) -> std::io::Result<String> {
-    debug!("Reading PEM file: {path}");
+    debug!("Reading PEM file");
     tokio::fs::read_to_string(path).await.map_err(|e| {
         std::io::Error::new(e.kind(), format!("Failed to read PEM file '{path}': {e}"))
     })

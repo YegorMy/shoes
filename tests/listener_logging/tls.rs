@@ -3,6 +3,8 @@
 //! treated as server output. Raw records and both process channels are retained.
 #[path = "tls_guard.rs"]
 mod guard;
+#[path = "tls_trace.rs"]
+mod trace;
 
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -61,6 +63,7 @@ impl LogWriter for Writer {
             })
             .unwrap()
         );
+        trace::bridge(record);
         if record.target() == "shoes::tcp::tcp_server::listener" {
             TERMINALS.fetch_add(1, Ordering::SeqCst);
         }
@@ -479,6 +482,8 @@ async fn exercise(policy: &mut Policy) {
     tokio::spawn(async {
         log::debug!(target: "tls_privacy_control", "debug collector active");
         log::trace!(target: "tls_privacy_control", "trace collector active");
+        tracing::debug!(target: "tls_privacy_control", "debug collector active");
+        tracing::trace!(target: "tls_privacy_control", "trace collector active");
     })
     .await
     .unwrap();
@@ -626,13 +631,7 @@ fn inspect(dir: &Path, stdout: &[u8], stderr: &[u8], trace: bool) {
                 "server record misattributed to fixture"
             );
             assert!(
-                event.target.starts_with("rustls::client::")
-                    || matches!(
-                        event.target.as_str(),
-                        "rustls::common_state"
-                            | "rustls::conn"
-                            | "shoes::tcp::tcp_client_handler_factory"
-                    ),
+                guard::fixture_record(event).is_ok(),
                 "unclassified fixture target: {event:?}"
             );
         } else {
@@ -708,6 +707,7 @@ fn inspect(dir: &Path, stdout: &[u8], stderr: &[u8], trace: bool) {
             );
         }
     }
+    trace::inspect(dir, &policy.protected, &events);
 }
 
 #[test]
@@ -715,6 +715,7 @@ fn server_diagnostics_are_private() {
     if let Ok(dir) = std::env::var(CHILD) {
         let dir = Path::new(&dir);
         let trace = std::env::var("SHOES_TLS_PRIVACY_LEVEL").unwrap() == "TRACE";
+        trace::install(dir);
         init_multi_logger(
             vec![Box::new(Writer {
                 file: FileLogWriter::new(dir.join("engine.log").to_str().unwrap()).unwrap(),
@@ -783,5 +784,201 @@ fn server_diagnostics_are_private() {
             dir.display()
         );
         inspect(&dir, &output.stdout, &output.stderr, level == "TRACE");
+    }
+}
+
+fn cli_usage() -> String {
+    format!(
+        "{} [OPTIONS] <config.yaml> [config.yaml...]\n\nOPTIONS:\n    -t, --threads NUM    Set the number of worker threads (default: CPU count)\n    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)\n    -d, --dry-run        Parse the config and exit\n    --no-reload          Disable automatic config reloading on file changes\n    -V, --version        Print version information and exit\n\nCOMMANDS:\n    generate-reality-keypair                       Generate a new Reality X25519 keypair\n    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password\n    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)\n",
+        env!("CARGO_BIN_EXE_shoes")
+    )
+}
+
+#[test]
+fn cli_configuration_diagnostics_are_private() {
+    let root = std::env::var_os("SHOES_TLS_PRIVACY_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&root).unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("cli-privacy-")
+        .tempdir_in(root)
+        .unwrap()
+        .keep();
+    let cert = Certificate::new();
+    let cert_path = root.join("cli-device-certificate-path-canary.pem");
+    let key_path = root.join("cli-device-private-key-path-canary.pem");
+    std::fs::write(&cert_path, &cert.pem).unwrap();
+    std::fs::write(&key_path, &cert.key_pem).unwrap();
+    let yaml = format!(
+        r#"
+- address: '127.0.0.1:0'
+  protocol:
+    type: tls
+    shadowtls_targets:
+      '{SNI}':
+        password: '{PASSWORD}'
+        handshake:
+          cert: '{}'
+          key: '{}'
+        protocol:
+          type: shadowsocks
+          cipher: '2022-blake3-aes-128-gcm'
+          password: '{SS_KEY}'
+  rules:
+    - masks: ['192.0.2.173', 'cli-dns-query.private.invalid']
+      action: allow
+      client_chain:
+        - address: '198.51.100.174:49174'
+          protocol:
+            type: socks
+            username: 'cli-device-username-canary'
+            password: 'cli-upstream-password-canary'
+"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let mut policy = Policy::default();
+    for bytes in [
+        SNI.as_bytes(),
+        PASSWORD.as_bytes(),
+        SS_KEY.as_bytes(),
+        b"privacy-key-cana", // decoded Shadowsocks key
+        b"192.0.2.173",
+        b"198.51.100.174:49174",
+        b"cli-dns-query.private.invalid",
+        b"cli-device-username-canary",
+        b"cli-upstream-password-canary",
+        b"cli-device-certificate-path-canary",
+        b"cli-device-private-key-path-canary",
+        b"cli-config-path-canary",
+        b"cli-missing-pem-path-canary",
+        b"cli-unknown-field-error-canary",
+        b"cli-validation-group-error-canary",
+        cert.key.as_slice(),
+        cert.key_pem.as_bytes(),
+    ] {
+        policy.protect(bytes);
+    }
+    for line in cert.key_pem.lines().filter(|line| !line.starts_with('-')) {
+        policy.protected.push(line.to_owned());
+    }
+    std::fs::write(
+        root.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let loaded_stdout =
+        "Starting dry run.\nUsing custom thread count (1)\nLoaded 2 certs/keys from files\n";
+    for level in ["DEBUG", "TRACE"] {
+        for scenario in ["success", "parse-error", "pem-error", "validation-error"] {
+            let dir = root.join(format!("{level}-{scenario}"));
+            std::fs::create_dir(&dir).unwrap();
+            let config_path = dir.join("cli-config-path-canary.yaml");
+            let config = match scenario {
+                "parse-error" => "- cli-unknown-field-error-canary: secret\n".to_owned(),
+                "pem-error" => yaml.replace(
+                    cert_path.to_str().unwrap(),
+                    root.join("cli-missing-pem-path-canary.pem").to_str().unwrap(),
+                ),
+                "validation-error" => yaml.replace(
+                    "client_chain:\n        - address: '198.51.100.174:49174'\n          protocol:\n            type: socks\n            username: 'cli-device-username-canary'\n            password: 'cli-upstream-password-canary'",
+                    "client_chain: cli-validation-group-error-canary",
+                ),
+                _ => yaml.clone(),
+            };
+            if scenario != "success" {
+                assert_ne!(config, yaml, "negative scenario must change the input");
+            }
+            std::fs::write(&config_path, config).unwrap();
+            let file_path = dir.join("engine.log");
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([
+                    "--threads",
+                    "1",
+                    "--no-reload",
+                    "--dry-run",
+                    "--log-file",
+                    "-",
+                    "--log-file",
+                ])
+                .arg(&file_path)
+                .arg(&config_path)
+                .env("RUST_LOG", level)
+                .output()
+                .unwrap();
+            std::fs::write(dir.join("stdout.capture"), &output.stdout).unwrap();
+            std::fs::write(dir.join("stderr.capture"), &output.stderr).unwrap();
+            std::fs::write(dir.join("exit.txt"), output.status.to_string()).unwrap();
+            println!(
+                "Complete {level} CLI {scenario} captures: {}",
+                dir.display()
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(if matches!(scenario, "parse-error" | "pem-error") {
+                    1
+                } else {
+                    0
+                }),
+                "CLI exit changed; complete captures at {}",
+                dir.display()
+            );
+            let stdout = std::str::from_utf8(&output.stdout).unwrap();
+            let stderr = std::str::from_utf8(&output.stderr).unwrap();
+            let file = std::fs::read_to_string(&file_path).unwrap();
+            let (expected_stdout, expected_error) = match scenario {
+                "success" => (
+                    format!("{loaded_stdout}Finishing dry run, config parsed successfully.\n"),
+                    String::new(),
+                ),
+                "parse-error" => (
+                    "Starting dry run.\nUsing custom thread count (1)\n".into(),
+                    format!(
+                        "Failed to load server configs (kind=InvalidInput)\n\n{}",
+                        cli_usage()
+                    ),
+                ),
+                "pem-error" => (
+                    "Starting dry run.\nUsing custom thread count (1)\n".into(),
+                    format!(
+                        "Failed to load cert files (kind=NotFound)\n\n{}",
+                        cli_usage()
+                    ),
+                ),
+                _ => (
+                    loaded_stdout.into(),
+                    "Dry run failed, could not create server configs (kind=InvalidInput)\n\n"
+                        .into(),
+                ),
+            };
+            assert!(
+                guard::cli_channels(
+                    stdout,
+                    stderr,
+                    &file,
+                    &policy.protected,
+                    &expected_stdout,
+                    &expected_error
+                )
+                .is_ok(),
+                "CLI output rejected; complete captures at {}",
+                dir.display()
+            );
+            assert_eq!(
+                file.contains("TRACE shoes] Loading server configuration"),
+                level == "TRACE"
+            );
+            if scenario != "parse-error" {
+                assert!(file.contains("DEBUG shoes::config::pem] Reading PEM file\n"));
+            }
+            if matches!(scenario, "success" | "validation-error") {
+                assert!(file.contains("DEBUG shoes] Server configuration loaded\n"));
+            }
+            assert_eq!(
+                file.contains("DEBUG shoes] Server configuration validated\n"),
+                scenario == "success"
+            );
+        }
     }
 }

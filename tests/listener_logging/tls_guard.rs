@@ -18,6 +18,16 @@ fn count(message: &str, prefix: &str, suffix: &str) -> bool {
         .is_some_and(|s| !s.is_empty() && s.len() <= 10 && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
+pub(super) fn fixture_record(event: &Event) -> Result<(), &'static str> {
+    (event.target.starts_with("rustls::client::")
+        || matches!(
+            event.target.as_str(),
+            "rustls::common_state" | "rustls::conn" | "shoes::tcp::tcp_client_handler_factory"
+        ))
+    .then_some(())
+    .ok_or("unclassified fixture target")
+}
+
 pub(super) fn server_record(event: &Event, protected: &[String]) -> Result<(), &'static str> {
     let text = format!("{} {} {}", event.level, event.target, event.message);
     if protected.iter().any(|s| text.contains(s))
@@ -161,6 +171,73 @@ pub(super) fn server_record(event: &Event, protected: &[String]) -> Result<(), &
 pub(super) fn startup(line: &str, configured_bind: &str) -> bool {
     // Exact stdout context only. No prefix/suffix/extra fields, no other binds.
     line == format!("Starting ShadowTLSv3 TCP server at {configured_bind}")
+}
+
+pub(super) fn cli_channels(
+    stdout: &str,
+    stderr: &str,
+    file: &str,
+    protected: &[String],
+    expected_stdout: &str,
+    expected_error: &str,
+) -> Result<(), &'static str> {
+    if stdout != expected_stdout || stderr != format!("{file}{expected_error}") {
+        return Err("unclassified CLI process output or inconsistent log channels");
+    }
+    if [stdout, stderr, file]
+        .iter()
+        .any(|channel| protected.iter().any(|value| channel.contains(value)))
+    {
+        return Err("protected CLI disclosure");
+    }
+    if !file.is_empty() && !file.ends_with('\n') {
+        return Err("incomplete CLI file capture");
+    }
+    for line in file.lines() {
+        let (header, message) = line
+            .strip_prefix('[')
+            .and_then(|s| s.split_once("] "))
+            .ok_or("malformed or multiline CLI record")?;
+        let mut header = header.split(' ');
+        let timestamp = header.next().ok_or("missing CLI timestamp")?;
+        chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.3f")
+            .map_err(|_| "invalid CLI timestamp")?;
+        let level = header.next().ok_or("missing CLI level")?;
+        let target = header.next().ok_or("missing CLI target")?;
+        if header.next().is_some()
+            || !matches!(
+                (level, target, message),
+                ("TRACE", "shoes", "Loading server configuration")
+                    | ("DEBUG", "shoes", "Server configuration loaded")
+                    | ("DEBUG", "shoes", "Server configuration validated")
+                    | ("DEBUG", "shoes::config::pem", "Reading PEM file")
+            )
+        {
+            return Err("unclassified CLI diagnostic");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_guard_rejects_complete_channel_injections() {
+    let safe = "[2026-10-19T12:34:56.789 DEBUG shoes] Server configuration loaded\n";
+    let protected = vec!["cli-protected-path-canary".to_owned()];
+    assert!(cli_channels("", safe, safe, &protected, "", "").is_ok());
+    for injection in [
+        "cli-protected-path-canary",
+        "[2026-10-19T12:34:56.789 DEBUG shoes] Server configuration loaded extra-secret\n",
+        "[2026-10-19T12:34:56.789 DEBUG shoes peer=192.0.2.171] Server configuration loaded\n",
+        "[2026-10-19T12:34:56.789 DEBUG shoes::config::pem] Reading PEM file: /unknown/credential.pem\n",
+        "[2026-10-19T12:34:56.789 DEBUG unrelated] Server configuration loaded\n",
+        "ClientHelloPayload {\n server_name: unknown.private.invalid\n}\n",
+        "NewSessionTicketPayloadTls13 {\n ticket: aabb\n}\n",
+        "Starting ShadowTLSv3 TCP server at 127.0.0.1:41973 peer=192.0.2.171\n",
+    ] {
+        assert!(cli_channels(injection, safe, safe, &protected, "", "").is_err());
+        assert!(cli_channels("", &format!("{safe}{injection}"), safe, &protected, "", "").is_err());
+        assert!(cli_channels("", injection, injection, &protected, "", "").is_err());
+    }
 }
 
 #[test]

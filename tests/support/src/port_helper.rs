@@ -3,6 +3,7 @@
 //! Provides centralized port allocation with tracking and synchronization.
 //! All tests should use PortHelper instead of directly allocating ports.
 
+use rand::RngExt;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::{LazyLock, Mutex};
@@ -23,7 +24,7 @@ impl PortHelper {
     }
 
     /// Get a random available address (IP, port) for a listening server.
-    /// Uses kernel-selected localhost ports on Darwin and random 127/8 IPs elsewhere.
+    /// Uses localhost on Darwin and random 127/8 IPs elsewhere.
     /// This address will be tracked and waited for in wait_for_all_ports().
     pub fn get_listener_port(&mut self) -> (String, u16) {
         let (ip, port) = get_random_addr();
@@ -98,14 +99,19 @@ static ALLOCATED_ENDPOINTS: LazyLock<Mutex<HashSet<SocketAddr>>> =
 /// Probe TCP and UDP together and never reissue an endpoint within this process.
 fn allocate_addr(mut choose_ip: impl FnMut() -> IpAddr) -> SocketAddr {
     let mut allocated = ALLOCATED_ENDPOINTS.lock().unwrap();
+    let mut rng = rand::rng();
     for _ in 0..128 {
-        let ip = choose_ip();
-        if let Ok(listener) = TcpListener::bind((ip, 0)) {
-            let address = listener.local_addr().unwrap();
-            if !allocated.contains(&address) && UdpSocket::bind(address).is_ok() {
-                allocated.insert(address);
-                return address;
-            }
+        // Check before probing: bind(ip, 0) can temporarily own an issued endpoint
+        // while its caller is about to bind. Avoid the usual ephemeral range too.
+        let address = SocketAddr::new(choose_ip(), rng.random_range(1024..32768));
+        if allocated.contains(&address) {
+            continue;
+        }
+        if let Ok(_listener) = TcpListener::bind(address)
+            && UdpSocket::bind(address).is_ok()
+        {
+            allocated.insert(address);
+            return address;
         }
     }
     panic!("failed to allocate a fresh TCP/UDP loopback endpoint after 128 probes");
@@ -116,7 +122,6 @@ fn get_random_addr() -> (String, u16) {
     let address = allocate_addr(|| Ipv4Addr::LOCALHOST.into());
     #[cfg(not(target_vendor = "apple"))]
     let address = {
-        use rand::RngExt;
         let mut rng = rand::rng();
         allocate_addr(|| {
             loop {

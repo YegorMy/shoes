@@ -65,7 +65,7 @@ use std::path::Path;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
-use log::debug;
+use log::{debug, trace};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tcp_server::start_servers;
 use tokio::runtime::Builder;
@@ -90,14 +90,20 @@ fn start_notify_thread(
                 tx.send(ConfigChanged {}).unwrap();
             }
         }
-        Err(e) => println!("watch error: {e:?}"),
+        Err(_) => eprintln!("Config watcher failed"),
     })
-    .unwrap();
+    .unwrap_or_else(|_| {
+        eprintln!("Failed to initialize config watcher");
+        std::process::exit(1);
+    });
 
     for config_path in config_paths {
         watcher
             .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
+            .unwrap_or_else(|_| {
+                eprintln!("Failed to watch config file");
+                std::process::exit(1);
+            });
     }
 
     (watcher, rx)
@@ -187,7 +193,7 @@ fn main() {
         match logging::FileLogWriter::new(path) {
             Ok(w) => writers.push(Box::new(w)),
             Err(e) => {
-                eprintln!("Failed to open log file {path}: {e}");
+                eprintln!("Failed to open log file (kind={:?})", e.kind());
                 std::process::exit(1);
             }
         }
@@ -325,10 +331,11 @@ fn main() {
         };
 
         loop {
+            trace!("Loading server configuration");
             let configs = match config::load_configs(&args).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to load server configs: {e}\n");
+                    eprintln!("Failed to load server configs (kind={:?})\n", e.kind());
                     print_usage_and_exit(arg0);
                     return;
                 }
@@ -337,26 +344,26 @@ fn main() {
             let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to load cert files: {e}\n");
+                    eprintln!("Failed to load cert files (kind={:?})\n", e.kind());
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
 
             if load_file_count > 0 {
-                    println!("Loaded {load_file_count} certs/keys from files");
+                println!("Loaded {load_file_count} certs/keys from files");
             }
 
-            for config in configs.iter() {
-                debug!("================================================================================");
-                debug!("{config:#?}");
-            }
-            debug!("================================================================================");
+            debug!("Server configuration loaded");
 
             if dry_run {
                 if let Err(e) = config::create_server_configs(configs) {
-                    eprintln!("Dry run failed, could not create server configs: {e}\n");
+                    eprintln!(
+                        "Dry run failed, could not create server configs (kind={:?})\n",
+                        e.kind()
+                    );
                 } else {
+                    debug!("Server configuration validated");
                     println!("Finishing dry run, config parsed successfully.");
                 }
                 return;
@@ -367,11 +374,12 @@ fn main() {
             let server_configs = match config::create_server_configs(configs) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to create server configs: {e}\n");
+                    eprintln!("Failed to create server configs (kind={:?})\n", e.kind());
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
+            debug!("Server configuration validated");
 
             let config::ValidatedConfigs {
                 configs: server_configs,
@@ -382,7 +390,7 @@ fn main() {
             let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Failed to build DNS registry: {e}\n");
+                    eprintln!("Failed to build DNS registry (kind={:?})\n", e.kind());
                     print_usage_and_exit(arg0);
                     return;
                 }
@@ -398,7 +406,13 @@ fn main() {
                     _ => None,
                 };
                 let resolver = dns_registry.get_for_server(dns_ref);
-                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
+                match start_servers(server_config, resolver).await {
+                    Ok(handles) => join_handles.extend(handles),
+                    Err(e) => {
+                        eprintln!("Failed to start server (kind={:?})", e.kind());
+                        std::process::exit(1);
+                    }
+                }
             }
 
             match reload_state.as_mut() {
