@@ -738,6 +738,7 @@ pub struct ProxyTestFixture {
     proxies: Vec<ProxyConfig>,
     certs: Vec<(tempfile::TempPath, tempfile::TempPath)>,
     local_server: Option<LocalServerConfig>,
+    local_endpoint: Option<super::port_helper::OwnedEndpoint>,
     ports: super::port_helper::PortHelper,
 }
 
@@ -782,6 +783,7 @@ impl ProxyTestFixture {
             proxies: Vec::new(),
             certs: Vec::new(),
             local_server: None,
+            local_endpoint: None,
             ports: super::port_helper::PortHelper::new(),
         }
     }
@@ -2556,7 +2558,10 @@ impl ProxyTestFixture {
 
     /// Add a local HTTP test server as final destination
     pub fn with_local_http_server(mut self) -> Self {
-        let (ip, port) = self.ports.get_listener_port();
+        let endpoint = self.ports.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        self.local_endpoint = Some(endpoint);
         self.local_server = Some(LocalServerConfig {
             ip,
             port,
@@ -2566,7 +2571,10 @@ impl ProxyTestFixture {
     }
 
     pub fn with_local_http_server_on_localhost(mut self) -> Self {
-        let (ip, port) = self.ports.get_localhost_listener_port();
+        let endpoint = self.ports.get_localhost_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        self.local_endpoint = Some(endpoint);
         self.local_server = Some(LocalServerConfig {
             ip,
             port,
@@ -2576,7 +2584,10 @@ impl ProxyTestFixture {
     }
 
     pub fn with_local_http_server_ipv6(mut self) -> Self {
-        let (ip, port) = self.ports.get_ipv6_listener_port();
+        let endpoint = self.ports.get_ipv6_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        self.local_endpoint = Some(endpoint);
         self.local_server = Some(LocalServerConfig {
             ip,
             port,
@@ -2587,7 +2598,10 @@ impl ProxyTestFixture {
 
     /// Add a local HTTPS/TLS1.3 test server as final destination
     pub fn with_local_https_tls13_server(mut self) -> Self {
-        let (ip, port) = self.ports.get_listener_port();
+        let endpoint = self.ports.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        self.local_endpoint = Some(endpoint);
         self.local_server = Some(LocalServerConfig {
             ip,
             port,
@@ -2598,7 +2612,10 @@ impl ProxyTestFixture {
 
     /// Add a local HTTPS/TLS1.2 test server as final destination
     pub fn with_local_https_tls12_server(mut self) -> Self {
-        let (ip, port) = self.ports.get_listener_port();
+        let endpoint = self.ports.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        self.local_endpoint = Some(endpoint);
         self.local_server = Some(LocalServerConfig {
             ip,
             port,
@@ -3008,6 +3025,39 @@ impl ProxyTestFixture {
         }
     }
 
+    async fn start_local_server(&mut self) -> std::io::Result<Option<test_servers::TestServer>> {
+        let Some(config) = self.local_server.as_ref() else {
+            return Ok(None);
+        };
+        let endpoint = self
+            .local_endpoint
+            .take()
+            .ok_or_else(|| std::io::Error::other("local server endpoint already consumed"))?;
+        let server = match config.protocol {
+            LocalServerProtocol::Http => {
+                test_servers::start_local_http_server_owned(endpoint).await?
+            }
+            LocalServerProtocol::HttpsTls12 | LocalServerProtocol::HttpsTls13 => {
+                let (cert, key) = generate_test_cert()?;
+                let version = match config.protocol {
+                    LocalServerProtocol::HttpsTls12 => TlsVersion::Tls12Only,
+                    LocalServerProtocol::HttpsTls13 => TlsVersion::Tls13Only,
+                    LocalServerProtocol::Http => unreachable!(),
+                };
+                let server = test_servers::start_local_https_server_owned(
+                    endpoint,
+                    AsRef::<Path>::as_ref(&cert),
+                    AsRef::<Path>::as_ref(&key),
+                    version,
+                )
+                .await?;
+                self.certs.push((cert, key));
+                server
+            }
+        };
+        Ok(Some(server))
+    }
+
     /// Build the fixture and start all servers
     pub async fn build(mut self) -> Result<BuiltFixture, Box<dyn std::error::Error>> {
         // Wire up proxy chain
@@ -3021,44 +3071,8 @@ impl ProxyTestFixture {
         let mut tun_interface: Option<String> = None;
         let mut tun_virtual_server_ip: Option<String> = None;
 
-        // Start local server if configured
-        if let Some(ref local_config) = self.local_server {
-            match local_config.protocol {
-                LocalServerProtocol::Http => {
-                    local_servers.push(
-                        test_servers::start_local_http_server(&local_config.ip, local_config.port)
-                            .await?,
-                    );
-                }
-                LocalServerProtocol::HttpsTls12 => {
-                    let (cert, key) = generate_test_cert()?;
-                    local_servers.push(
-                        test_servers::start_local_https_server(
-                            &local_config.ip,
-                            local_config.port,
-                            AsRef::<Path>::as_ref(&cert),
-                            AsRef::<Path>::as_ref(&key),
-                            TlsVersion::Tls12Only,
-                        )
-                        .await?,
-                    );
-                    self.certs.push((cert, key));
-                }
-                LocalServerProtocol::HttpsTls13 => {
-                    let (cert, key) = generate_test_cert()?;
-                    local_servers.push(
-                        test_servers::start_local_https_server(
-                            &local_config.ip,
-                            local_config.port,
-                            AsRef::<Path>::as_ref(&cert),
-                            AsRef::<Path>::as_ref(&key),
-                            TlsVersion::Tls13Only,
-                        )
-                        .await?,
-                    );
-                    self.certs.push((cert, key));
-                }
-            }
+        if let Some(server) = self.start_local_server().await? {
+            local_servers.push(server);
         }
 
         // Set up TUN entry if configured (must be done before starting proxies)
@@ -6173,5 +6187,139 @@ impl BuiltFixture {
             );
             Ok(elapsed)
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_endpoint_tests {
+    use super::*;
+    use std::net::{SocketAddr, TcpListener, UdpSocket};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    fn address(fixture: &ProxyTestFixture) -> SocketAddr {
+        let config = fixture.local_server.as_ref().unwrap();
+        SocketAddr::new(config.ip.parse().unwrap(), config.port)
+    }
+
+    fn assert_exclusive(address: SocketAddr) {
+        assert_eq!(
+            TcpListener::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            UdpSocket::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+
+    async fn response(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+            assert!(headers.len() < 4096);
+        }
+        assert!(headers.starts_with(b"HTTP/1.1 200"));
+        let mut body = [0; 19];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"XXXXXXXXXXXXXXXXXXX");
+    }
+
+    #[tokio::test]
+    async fn fixture_local_servers_keep_pending_connections_through_build_adapter() {
+        let fixtures = [
+            ProxyTestFixture::new().with_local_http_server(),
+            ProxyTestFixture::new().with_local_http_server_on_localhost(),
+            ProxyTestFixture::new().with_local_http_server_ipv6(),
+            ProxyTestFixture::new().with_local_https_tls12_server(),
+            ProxyTestFixture::new().with_local_https_tls13_server(),
+        ];
+        for mut fixture in fixtures {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let address = address(&fixture);
+                assert!(address.ip().is_loopback());
+                assert_exclusive(address);
+                let protocol = fixture.local_server.as_ref().unwrap().protocol;
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                let request =
+                    b"GET /bytes/19 HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n";
+                if matches!(protocol, LocalServerProtocol::Http) {
+                    stream.write_all(request).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert_exclusive(address);
+                // This is the same consuming adapter called by build(), without external peers.
+                let server = fixture.start_local_server().await.unwrap().unwrap();
+                assert_eq!(server.local_addr(), address);
+                assert!(fixture.local_endpoint.is_none());
+                fixture.ports.wait_for_all_ports().await.unwrap();
+                assert_eq!(
+                    TcpListener::bind(address).unwrap_err().kind(),
+                    std::io::ErrorKind::AddrInUse
+                );
+                let unused_udp = UdpSocket::bind(address).unwrap();
+                match protocol {
+                    LocalServerProtocol::Http => response(&mut stream).await,
+                    LocalServerProtocol::HttpsTls12 | LocalServerProtocol::HttpsTls13 => {
+                        let mut roots = rustls::RootCertStore::empty();
+                        let pem = std::fs::read(&fixture.certs.last().unwrap().0).unwrap();
+                        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                            roots.add(cert.unwrap()).unwrap();
+                        }
+                        let (version, expected) = match protocol {
+                            LocalServerProtocol::HttpsTls12 => {
+                                (&rustls::version::TLS12, rustls::ProtocolVersion::TLSv1_2)
+                            }
+                            LocalServerProtocol::HttpsTls13 => {
+                                (&rustls::version::TLS13, rustls::ProtocolVersion::TLSv1_3)
+                            }
+                            LocalServerProtocol::Http => unreachable!(),
+                        };
+                        let config =
+                            rustls::ClientConfig::builder_with_protocol_versions(&[version])
+                                .with_root_certificates(roots)
+                                .with_no_client_auth();
+                        let connector =
+                            tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+                        let mut stream = connector
+                            .connect("test.local".try_into().unwrap(), stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(stream.get_ref().1.protocol_version(), Some(expected));
+                        stream.write_all(request).await.unwrap();
+                        response(&mut stream).await;
+                    }
+                }
+                server.stop().await.unwrap();
+                drop(unused_udp);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn dropped_unbuilt_fixture_releases_both_sockets() {
+        let fixture = ProxyTestFixture::new().with_local_http_server_on_localhost();
+        let address = address(&fixture);
+        assert_exclusive(address);
+        drop(fixture);
+        let listener = TcpListener::bind(address).unwrap();
+        let socket = UdpSocket::bind(address).unwrap();
+        assert_eq!(listener.local_addr().unwrap(), address);
+        assert_eq!(socket.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn failed_fixture_build_releases_local_server() {
+        let fixture = ProxyTestFixture::new().with_local_http_server_on_localhost();
+        let address = address(&fixture);
+        assert_exclusive(address);
+        let result = fixture.build().await;
+        assert!(matches!(result, Err(error) if error.to_string() == "No proxies configured"));
+        tokio::task::yield_now().await;
+        let listener = TcpListener::bind(address).unwrap();
+        let socket = UdpSocket::bind(address).unwrap();
+        assert_eq!(listener.local_addr().unwrap(), address);
+        assert_eq!(socket.local_addr().unwrap(), address);
     }
 }

@@ -3,6 +3,7 @@
 //! This module provides simple HTTP and HTTPS servers with configurable TLS versions
 //! for testing protocol behavior with different TLS scenarios.
 
+use super::port_helper::OwnedEndpoint;
 use aws_lc_rs::digest::{Context, SHA256};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
@@ -37,6 +38,15 @@ impl TestServer {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    pub async fn stop(mut self) -> Result<(), tokio::task::JoinError> {
+        self.task.abort();
+        match (&mut self.task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -81,6 +91,30 @@ where
     F: Fn(&[u8], SocketAddr) -> Vec<u8> + Send + 'static,
 {
     let socket = UdpSocket::bind(socket_addr(ip, port)?).await?;
+    start_udp_response_server_with_socket(socket, response)
+}
+
+pub async fn start_udp_echo_server_owned(endpoint: OwnedEndpoint) -> std::io::Result<TestServer> {
+    start_udp_response_server_owned(endpoint, |payload, _| [payload, b" [ECHO]"].concat()).await
+}
+
+pub async fn start_udp_response_server_owned<F>(
+    endpoint: OwnedEndpoint,
+    response: F,
+) -> std::io::Result<TestServer>
+where
+    F: Fn(&[u8], SocketAddr) -> Vec<u8> + Send + 'static,
+{
+    start_udp_response_server_with_socket(endpoint.into_udp_socket()?, response)
+}
+
+fn start_udp_response_server_with_socket<F>(
+    socket: UdpSocket,
+    response: F,
+) -> std::io::Result<TestServer>
+where
+    F: Fn(&[u8], SocketAddr) -> Vec<u8> + Send + 'static,
+{
     let address = socket.local_addr()?;
     let task = tokio::spawn(async move {
         let mut buffer = vec![0; 65_536];
@@ -149,6 +183,16 @@ pub async fn start_udp_asymmetric_echo_server(
 pub async fn start_tcp_eof_echo_server(ip: &str, port: u16) -> std::io::Result<TestServer> {
     let addr = socket_addr(ip, port)?;
     let listener = TcpListener::bind(addr).await?;
+    start_tcp_eof_echo_server_with_listener(listener)
+}
+
+pub async fn start_tcp_eof_echo_server_owned(
+    endpoint: OwnedEndpoint,
+) -> std::io::Result<TestServer> {
+    start_tcp_eof_echo_server_with_listener(endpoint.into_tcp_listener()?)
+}
+
+fn start_tcp_eof_echo_server_with_listener(listener: TcpListener) -> std::io::Result<TestServer> {
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
@@ -201,6 +245,18 @@ async fn echo_stream(
 
 pub async fn start_tcp_stream_echo_server(ip: &str, port: u16) -> std::io::Result<TestServer> {
     let listener = TcpListener::bind(socket_addr(ip, port)?).await?;
+    start_tcp_stream_echo_server_with_listener(listener)
+}
+
+pub async fn start_tcp_stream_echo_server_owned(
+    endpoint: OwnedEndpoint,
+) -> std::io::Result<TestServer> {
+    start_tcp_stream_echo_server_with_listener(endpoint.into_tcp_listener()?)
+}
+
+fn start_tcp_stream_echo_server_with_listener(
+    listener: TcpListener,
+) -> std::io::Result<TestServer> {
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
@@ -483,6 +539,14 @@ async fn handle_request(
 pub async fn start_local_http_server(ip: &str, port: u16) -> std::io::Result<TestServer> {
     let addr = socket_addr(ip, port)?;
     let listener = TcpListener::bind(addr).await?;
+    start_local_http_server_with_listener(listener)
+}
+
+pub async fn start_local_http_server_owned(endpoint: OwnedEndpoint) -> std::io::Result<TestServer> {
+    start_local_http_server_with_listener(endpoint.into_tcp_listener()?)
+}
+
+fn start_local_http_server_with_listener(listener: TcpListener) -> std::io::Result<TestServer> {
     let address = listener.local_addr()?;
     eprintln!("[TEST_SERVER] HTTP server listening on {}", address);
 
@@ -585,6 +649,29 @@ pub async fn start_local_https_server(
 ) -> std::io::Result<TestServer> {
     let addr = socket_addr(ip, port)?;
     let listener = TcpListener::bind(addr).await?;
+    start_local_https_server_with_listener(listener, cert_path, key_path, tls_version)
+}
+
+pub async fn start_local_https_server_owned(
+    endpoint: OwnedEndpoint,
+    cert_path: &Path,
+    key_path: &Path,
+    tls_version: TlsVersion,
+) -> std::io::Result<TestServer> {
+    start_local_https_server_with_listener(
+        endpoint.into_tcp_listener()?,
+        cert_path,
+        key_path,
+        tls_version,
+    )
+}
+
+fn start_local_https_server_with_listener(
+    listener: TcpListener,
+    cert_path: &Path,
+    key_path: &Path,
+    tls_version: TlsVersion,
+) -> std::io::Result<TestServer> {
     let address = listener.local_addr()?;
 
     let tls_config = create_tls_config(cert_path, key_path, tls_version)?;
@@ -650,6 +737,29 @@ pub async fn start_tls_stream_echo_server(
     tls_version: TlsVersion,
 ) -> std::io::Result<TestServer> {
     let listener = TcpListener::bind(socket_addr(ip, port)?).await?;
+    start_tls_stream_echo_server_with_listener(listener, cert_path, key_path, tls_version)
+}
+
+pub async fn start_tls_stream_echo_server_owned(
+    endpoint: OwnedEndpoint,
+    cert_path: &Path,
+    key_path: &Path,
+    tls_version: TlsVersion,
+) -> std::io::Result<TestServer> {
+    start_tls_stream_echo_server_with_listener(
+        endpoint.into_tcp_listener()?,
+        cert_path,
+        key_path,
+        tls_version,
+    )
+}
+
+fn start_tls_stream_echo_server_with_listener(
+    listener: TcpListener,
+    cert_path: &Path,
+    key_path: &Path,
+    tls_version: TlsVersion,
+) -> std::io::Result<TestServer> {
     let address = listener.local_addr()?;
     let acceptor = TlsAcceptor::from(create_tls_config(cert_path, key_path, tls_version)?);
     let task = tokio::spawn(async move {
@@ -697,11 +807,102 @@ mod tests {
     use std::time::Duration;
     use tokio::time::sleep;
 
+    #[tokio::test]
+    async fn owned_udp_handoff_preserves_queued_packets_and_source() {
+        let mut ports = super::super::port_helper::PortHelper::new();
+        let endpoint = ports.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let client = UdpSocket::bind(SocketAddr::new(address.ip(), 0))
+            .await
+            .unwrap();
+        client.send_to(b"queued", address).await.unwrap();
+        let server = start_udp_echo_server_owned(endpoint).await.unwrap();
+        assert_eq!(server.local_addr(), address);
+        let mut response = [0; 32];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, address);
+        assert_eq!(&response[..length], b"queued [ECHO]");
+        // UDP conversion releases the unused TCP counterpart immediately.
+        let counterpart = std::net::TcpListener::bind(address).unwrap();
+        assert_eq!(
+            UdpSocket::bind(address).await.unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        server.stop().await.unwrap();
+        let released = std::net::UdpSocket::bind(address).unwrap();
+        assert_eq!(released.local_addr().unwrap(), address);
+        drop(counterpart);
+    }
+
+    #[tokio::test]
+    async fn owned_tcp_handoff_preserves_pending_stream_and_eof() {
+        for eof in [false, true] {
+            let mut ports = super::super::port_helper::PortHelper::new();
+            let endpoint = ports.get_listener_endpoint();
+            let address = endpoint.local_addr();
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client.write_all(b"queued tcp").await.unwrap();
+            let server = if eof {
+                client.shutdown().await.unwrap();
+                start_tcp_eof_echo_server_owned(endpoint).await.unwrap()
+            } else {
+                start_tcp_stream_echo_server_owned(endpoint).await.unwrap()
+            };
+            assert_eq!(server.local_addr(), address);
+            ports.wait_for_all_ports().await.unwrap();
+            let expected: &[u8] = if eof {
+                b"queued tcp [ECHO]"
+            } else {
+                b"queued tcp"
+            };
+            let mut response = vec![0; expected.len()];
+            tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, expected);
+            let counterpart = std::net::UdpSocket::bind(address).unwrap();
+            assert_eq!(
+                std::net::TcpListener::bind(address).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse
+            );
+            drop(client);
+            server.stop().await.unwrap();
+            drop(counterpart);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tls_construction_releases_owned_pair() {
+        let mut ports = super::super::port_helper::PortHelper::new();
+        let endpoint = ports.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let missing = tempfile::tempdir().unwrap();
+        let result = start_local_https_server_owned(
+            endpoint,
+            &missing.path().join("missing-cert"),
+            &missing.path().join("missing-key"),
+            TlsVersion::Tls13Only,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let socket = std::net::UdpSocket::bind(address).unwrap();
+        assert_eq!(listener.local_addr().unwrap(), address);
+        assert_eq!(socket.local_addr().unwrap(), address);
+    }
+
     /// Test helper that verifies local HTTP server works and returns correct data size
     async fn test_local_http_with_size(data_size: usize) -> Result<(), Box<dyn std::error::Error>> {
         let mut port_helper = super::super::port_helper::PortHelper::new();
-        let (ip, port) = port_helper.get_listener_port();
-        let _server = start_local_http_server(&ip, port).await?;
+        let endpoint = port_helper.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
+        let _server = start_local_http_server_owned(endpoint).await?;
         port_helper.wait_for_all_ports().await?;
 
         let url = format!("http://{}:{}/bytes/{}", ip, port, data_size);
@@ -722,12 +923,13 @@ mod tests {
         data_size: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut port_helper = super::super::port_helper::PortHelper::new();
-        let (ip, port) = port_helper.get_listener_port();
+        let endpoint = port_helper.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
         let (cert_path, key_path) = generate_test_cert()?;
 
-        let _server = start_local_https_server(
-            &ip,
-            port,
+        let _server = start_local_https_server_owned(
+            endpoint,
             AsRef::<Path>::as_ref(&cert_path),
             AsRef::<Path>::as_ref(&key_path),
             TlsVersion::Tls13Only,
@@ -753,12 +955,13 @@ mod tests {
         data_size: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut port_helper = super::super::port_helper::PortHelper::new();
-        let (ip, port) = port_helper.get_listener_port();
+        let endpoint = port_helper.get_listener_endpoint();
+        let address = endpoint.local_addr();
+        let (ip, port) = (address.ip().to_string(), address.port());
         let (cert_path, key_path) = generate_test_cert()?;
 
-        let _server = start_local_https_server(
-            &ip,
-            port,
+        let _server = start_local_https_server_owned(
+            endpoint,
             AsRef::<Path>::as_ref(&cert_path),
             AsRef::<Path>::as_ref(&key_path),
             TlsVersion::Tls12Only,

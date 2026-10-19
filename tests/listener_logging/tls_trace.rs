@@ -372,7 +372,10 @@ fn tracing_collector_preserves_injected_event_and_span_fields() {
         .tempdir_in(root)
         .unwrap()
         .keep();
-    println!("Complete injected tracing control capture: {}", dir.display());
+    println!(
+        "Complete injected tracing control capture: {}",
+        dir.display()
+    );
     let payload = "Finished {\n verify_data: tracing-payload-canary\n}";
     tracing::subscriber::with_default(collector(&dir), || {
         let assert_no_current = || {
@@ -485,7 +488,11 @@ fn tracing_collector_preserves_injected_event_and_span_fields() {
             .enumerate()
             .filter(|(_, record)| record.kind == "span_close" && record.span == span)
             .collect();
-        assert_eq!(closes.len(), 1, "span must close only after its last handle");
+        assert_eq!(
+            closes.len(),
+            1,
+            "span must close only after its last handle"
+        );
         assert!(field < closes[0].0, "field must precede span closure");
     }
     assert!(
