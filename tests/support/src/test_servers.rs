@@ -740,20 +740,6 @@ pub async fn start_tls_stream_echo_server(
     start_tls_stream_echo_server_with_listener(listener, cert_path, key_path, tls_version)
 }
 
-pub async fn start_tls_stream_echo_server_owned(
-    endpoint: OwnedEndpoint,
-    cert_path: &Path,
-    key_path: &Path,
-    tls_version: TlsVersion,
-) -> std::io::Result<TestServer> {
-    start_tls_stream_echo_server_with_listener(
-        endpoint.into_tcp_listener()?,
-        cert_path,
-        key_path,
-        tls_version,
-    )
-}
-
 fn start_tls_stream_echo_server_with_listener(
     listener: TcpListener,
     cert_path: &Path,
