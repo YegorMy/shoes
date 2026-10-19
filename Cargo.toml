@@ -131,6 +131,7 @@ shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"
 tracing = { version = "*", default-features = false, features = ["std"] }
+tracing-core = { version = "=0.1.36", default-features = false, features = ["std"] }
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

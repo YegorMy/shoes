@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
+use tracing_core::span::Current;
 
 use super::{FIXTURE_CLIENT, guard};
 
@@ -155,6 +156,13 @@ impl Subscriber for Collector {
     fn clone_span(&self, span: &Id) -> Id {
         self.spans.lock().get_mut(&span.into_u64()).unwrap().1 += 1;
         span.clone()
+    }
+
+    fn current_span(&self) -> Current {
+        match self.current() {
+            Some(id) => Current::new(Id::from_u64(id), self.spans.lock()[&id].0),
+            None => Current::none(),
+        }
     }
 
     fn try_close(&self, span: Id) -> bool {
@@ -355,19 +363,68 @@ fn tracing_guard_rejects_extra_fields_spans_and_wrong_contexts() {
 
 #[test]
 fn tracing_collector_preserves_injected_event_and_span_fields() {
-    let dir = tempfile::tempdir().unwrap();
+    let root = std::env::var_os("SHOES_TLS_PRIVACY_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("tracing-control-")
+        .tempdir_in(root)
+        .unwrap()
+        .keep();
+    println!("Complete injected tracing control capture: {}", dir.display());
     let payload = "Finished {\n verify_data: tracing-payload-canary\n}";
-    tracing::subscriber::with_default(collector(dir.path()), || {
+    tracing::subscriber::with_default(collector(&dir), || {
+        let assert_no_current = || {
+            assert!(tracing::Span::current().is_none());
+            tracing::dispatcher::get_default(|dispatch| {
+                let current = dispatch.current_span();
+                assert!(current.is_known());
+                assert!(current.id().is_none());
+                assert!(current.metadata().is_none());
+            });
+        };
+        assert_no_current();
         let span = tracing::debug_span!(target: "tls_privacy_control", "injected span",
             sni = "tracing-sni.private.invalid", credential = tracing::field::Empty);
         span.record("credential", "tracing-credential-canary");
-        let _entered = span.enter();
-        let child = tracing::debug_span!(target: "tls_privacy_control", "injected child");
-        let _child_entered = child.enter();
-        tracing::debug!(target: "tls_privacy_control", peer = "192.0.2.171:49171",
-            extra = payload, "debug collector active");
+        assert_no_current();
+        let retained_current = {
+            let _entered = span.enter();
+            let current = tracing::Span::current();
+            assert_eq!(current.id(), span.id());
+            assert!(std::ptr::eq(
+                current.metadata().unwrap(),
+                span.metadata().unwrap()
+            ));
+            current.record("credential", "tracing-current-credential-canary");
+            {
+                let child = tracing::debug_span!(target: "tls_privacy_control", "injected child",
+                    credential = tracing::field::Empty);
+                assert_eq!(tracing::Span::current().id(), span.id());
+                let _child_entered = child.enter();
+                let child_current = tracing::Span::current();
+                assert_eq!(child_current.id(), child.id());
+                assert!(std::ptr::eq(
+                    child_current.metadata().unwrap(),
+                    child.metadata().unwrap()
+                ));
+                child_current.record("credential", "tracing-nested-credential-canary");
+                tracing::debug!(target: "tls_privacy_control", peer = "192.0.2.171:49171",
+                    extra = payload, "debug collector active");
+            }
+            assert_eq!(tracing::Span::current().id(), span.id());
+            tracing::Span::current().record("credential", "tracing-restored-credential-canary");
+            current
+        };
+        assert_no_current();
+        drop(span);
+        retained_current.record("credential", "tracing-retained-credential-canary");
+        drop(retained_current);
+        assert_no_current();
     });
-    let raw = std::fs::read_to_string(dir.path().join("tracing.jsonl")).unwrap();
+    let raw = std::fs::read_to_string(dir.join("tracing.jsonl")).unwrap();
+    assert!(raw.ends_with('\n'), "incomplete tracing control capture");
     let records: Vec<TraceRecord> = raw
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -376,6 +433,10 @@ fn tracing_collector_preserves_injected_event_and_span_fields() {
         payload,
         "tracing-sni.private.invalid",
         "tracing-credential-canary",
+        "tracing-current-credential-canary",
+        "tracing-nested-credential-canary",
+        "tracing-restored-credential-canary",
+        "tracing-retained-credential-canary",
         "192.0.2.171:49171",
     ] {
         assert!(
@@ -404,6 +465,29 @@ fn tracing_collector_preserves_injected_event_and_span_fields() {
         child.related_span, parent.span,
         "implicit span ancestry must be retained"
     );
+    for (value, span) in [
+        ("tracing-credential-canary", parent.span),
+        ("tracing-current-credential-canary", parent.span),
+        ("tracing-nested-credential-canary", child.span),
+        ("tracing-restored-credential-canary", parent.span),
+        ("tracing-retained-credential-canary", parent.span),
+    ] {
+        let field = records
+            .iter()
+            .position(|record| {
+                record.kind == "span_fields"
+                    && record.span == span
+                    && record.fields == [("credential".into(), value.into())]
+            })
+            .unwrap();
+        let closes: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.kind == "span_close" && record.span == span)
+            .collect();
+        assert_eq!(closes.len(), 1, "span must close only after its last handle");
+        assert!(field < closes[0].0, "field must precede span closure");
+    }
     assert!(
         records
             .iter()

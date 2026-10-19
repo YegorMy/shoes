@@ -2133,6 +2133,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "tracing-core",
  "tun",
  "url",
  "webpki-roots",
