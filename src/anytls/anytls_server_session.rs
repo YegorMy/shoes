@@ -40,13 +40,29 @@ const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound on the graceful writer shutdown when a session closes.
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Taking handlers out of the registry must never detach them on cancellation,
+/// writer failure or a drain deadline. The semaphore still bounds these to eight.
+struct SettlingHandlers(Vec<JoinHandle<()>>);
+impl Drop for SettlingHandlers {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
+    #[cfg(test)]
+    pub(super) relay_gate: std::sync::Mutex<Option<Arc<super::write_eof_tests::RelayGate>>>,
     write_eof_enabled: AtomicBool,
     write_eof_agreed: AtomicBool,
     write_eof: Arc<Registry>,
     write_eof_rx: Mutex<mpsc::Receiver<Operation>>,
     write_eof_handler_slots: Arc<Semaphore>,
+    // Wire ids can be reused after registry retirement, before destination
+    // shutdown completes. Task identity retains *both* relays without collision.
+    write_eof_tasks: Mutex<HashMap<tokio::task::Id, JoinHandle<()>>>,
     /// Underlying connection (split into reader/writer)
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -128,11 +144,14 @@ impl AnyTlsSession {
         let (write_eof, write_eof_rx) = Registry::new(WriteEofOptions::default().eof_timeout);
 
         Arc::new(Self {
+            #[cfg(test)]
+            relay_gate: std::sync::Mutex::new(None),
             write_eof_enabled: AtomicBool::new(false),
             write_eof_agreed: AtomicBool::new(false),
             write_eof,
             write_eof_rx: Mutex::new(write_eof_rx),
             write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
+            write_eof_tasks: Mutex::new(HashMap::new()),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -184,11 +203,13 @@ impl AnyTlsSession {
         )]));
 
         Arc::new(Self {
+            relay_gate: std::sync::Mutex::new(None),
             write_eof_enabled: AtomicBool::new(false),
             write_eof_agreed: AtomicBool::new(false),
             write_eof,
             write_eof_rx: Mutex::new(write_eof_rx),
             write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
+            write_eof_tasks: Mutex::new(HashMap::new()),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -223,6 +244,14 @@ impl AnyTlsSession {
         self.write_eof_enabled.store(enabled, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(super) fn write_eof_resources_for_test(&self) -> (usize, usize) {
+        (
+            self.write_eof.stream_count_for_test(),
+            self.write_eof_handler_slots.available_permits(),
+        )
+    }
+
     /// Close the session
     pub async fn close(&self) {
         if self
@@ -231,6 +260,9 @@ impl AnyTlsSession {
             .is_ok()
         {
             self.write_eof.close();
+            for (_, handle) in self.write_eof_tasks.lock().await.drain() {
+                handle.abort();
+            }
             // Abort all active stream handler tasks first
             // This prevents memory leaks from hung tasks holding Arc<Self>
             {
@@ -276,18 +308,31 @@ impl AnyTlsSession {
 
         // Run the receive loop. Cancellation is checked first, so a session
         // cancelled before or while it runs handles no further frames.
+        let receive_and_settle = async {
+            session.recv_loop().await?;
+            if session.write_eof_agreed.load(Ordering::SeqCst) {
+                session.settle_write_eof_relays().await?;
+            }
+            Ok(())
+        };
         let result = match cancel {
             Some(cancel) => tokio::select! {
                 biased;
-                () = cancel.cancelled() => Ok(()),
+                () = cancel.cancelled() => {
+                    if session.write_eof_agreed.load(Ordering::SeqCst) {
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "write-eof/1 session cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                },
                 () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
                 result = session.process_outgoing() => result,
-                result = session.recv_loop() => result,
+                result = receive_and_settle => result,
             },
             None => tokio::select! {
                 () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
                 result = session.process_outgoing() => result,
-                result = session.recv_loop() => result,
+                result = receive_and_settle => result,
             },
         };
 
@@ -295,6 +340,26 @@ impl AnyTlsSession {
         session.close().await;
 
         result
+    }
+
+    async fn settle_write_eof_relays(&self) -> io::Result<()> {
+        let bound = self.write_eof.transport_eof_timeout()?;
+        tokio::time::timeout(bound, async {
+            let mut handlers = SettlingHandlers(
+                self.write_eof_tasks
+                    .lock()
+                    .await
+                    .drain()
+                    .map(|(_, task)| task)
+                    .collect(),
+            );
+            for task in &mut handlers.0 {
+                task.await.map_err(|_| protocol_error())?;
+            }
+            self.write_eof.finish_transport_eof()
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write-eof/1 relay drain timed out"))?
     }
 
     /// Process outgoing data from streams
@@ -371,7 +436,13 @@ impl AnyTlsSession {
             let n = {
                 let mut reader = self.reader.lock().await;
                 match reader.read_buf(&mut buffer).await {
-                    Ok(0) => return Ok(()), // Connection closed
+                    Ok(0) if buffer.is_empty() => return Ok(()),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated AnyTLS frame",
+                        ));
+                    }
                     Ok(n) => n,
                     Err(e) => return Err(e),
                 }
@@ -452,30 +523,21 @@ impl AnyTlsSession {
                     let (stream, _) = self.write_eof.open(stream_id, false)?;
                     let stream = AnyTlsStream::from_write_eof(stream);
                     let session = self.clone();
-                    let mut tasks = self.stream_tasks.lock().await;
-                    tasks.retain(|_, task| !task.is_finished());
-                    if tasks.len() >= MAX_STREAMS {
-                        return Err(protocol_error());
-                    }
-                    if let Some(retired) = tasks.remove(&stream_id) {
-                        // Registry::open already proved the old wire stream retired.
-                        // Do not detach its cleanup or let it remove the new task.
-                        retired.abort();
-                    }
+                    let mut tasks = self.write_eof_tasks.lock().await;
                     let handle = tokio::spawn(async move {
                         let _permit = permit;
                         // No new whole-live-stream timeout. EOF settlement has its
                         // own bounded timer in the negotiated stream, not in relay IO.
-                        let _ = session.handle_new_stream(stream).await;
-                        let mut tasks = session.stream_tasks.lock().await;
-                        if tasks
-                            .get(&stream_id)
-                            .is_some_and(|task| task.id() == tokio::task::id())
-                        {
-                            tasks.remove(&stream_id);
+                        if session.handle_new_stream(stream).await.is_err() {
+                            session.write_eof.fail_retirement();
                         }
+                        session
+                            .write_eof_tasks
+                            .lock()
+                            .await
+                            .remove(&tokio::task::id());
                     });
-                    tasks.insert(stream_id, handle);
+                    tasks.insert(handle.id(), handle);
                     return Ok(());
                 }
 
@@ -918,6 +980,13 @@ impl AnyTlsSession {
                     }
                 };
                 let mut client_stream = client_result.client_stream;
+                #[cfg(test)]
+                if let Some(gate) = self.relay_gate.lock().unwrap().clone() {
+                    client_stream = Box::new(super::write_eof_tests::GatedDestination::new(
+                        client_stream,
+                        gate,
+                    ));
+                }
 
                 // Send successful SYNACK (protocol v2)
                 if let Err(e) = self.send_synack(stream_id, None).await {
@@ -1137,6 +1206,24 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn write_eof_clean_transport_eof_rejects_truncated_header_and_body() {
+        for bytes in [b"\x02\0\0".as_slice(), b"\x02\0\0\0\x01\0\x03a"] {
+            let (transport, mut peer) = duplex(8192);
+            let session =
+                AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+            session.write_eof_agreed.store(true, Ordering::SeqCst);
+            peer.write_all(bytes).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let error = timeout(Duration::from_secs(1), session.run())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(session.is_closed());
+        }
+    }
 
     #[tokio::test]
     async fn write_eof_negotiation_enable_offer_and_protocol_guards() {

@@ -127,6 +127,363 @@ async fn session_pair() -> Arc<anytls_client_session::AnyTlsClientSession> {
 const UPLOAD: usize = 8 * 1024 * 1024;
 const RESPONSE: usize = 128 * 1024;
 
+// Bound the outstanding tail independently of OS TCP buffer sizes/scheduling.
+// All released writes, flushes and shutdowns still use the real TCP destination.
+pub(super) struct RelayGate {
+    remaining: std::sync::atomic::AtomicUsize,
+    blocked: tokio_util::sync::CancellationToken,
+    release: tokio_util::sync::CancellationToken,
+    hold_shutdown: bool,
+    fail_shutdown: bool,
+    shutdown_blocked: tokio_util::sync::CancellationToken,
+    release_shutdown: tokio_util::sync::CancellationToken,
+    wakers: [futures::task::AtomicWaker; 8],
+    next_slot: std::sync::atomic::AtomicUsize,
+}
+pub(super) struct GatedDestination {
+    inner: Box<dyn AsyncStream>,
+    gate: Arc<RelayGate>,
+    slot: usize,
+}
+impl GatedDestination {
+    pub(super) fn new(inner: Box<dyn AsyncStream>, gate: Arc<RelayGate>) -> Self {
+        let slot = gate
+            .next_slot
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(slot < gate.wakers.len());
+        Self { inner, gate, slot }
+    }
+}
+impl AsyncRead for GatedDestination {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, b)
+    }
+}
+impl AsyncWrite for GatedDestination {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.gate.wakers[self.slot].register(cx.waker());
+        let remaining = self.gate.remaining.load(SeqCst);
+        if remaining == 0 && !self.gate.release.is_cancelled() {
+            self.gate.blocked.cancel();
+            return Poll::Pending;
+        }
+        let count = if self.gate.release.is_cancelled() {
+            b.len()
+        } else {
+            remaining.min(b.len())
+        };
+        let result = Pin::new(&mut *self.inner).poll_write(cx, &b[..count]);
+        if let Poll::Ready(Ok(n)) = result {
+            self.gate.remaining.fetch_sub(n.min(remaining), SeqCst);
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.gate.wakers[self.slot].register(cx.waker());
+        if self.gate.hold_shutdown && !self.gate.release_shutdown.is_cancelled() {
+            self.gate.shutdown_blocked.cancel();
+            return Poll::Pending;
+        }
+        if self.gate.fail_shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "test destination shutdown failure",
+            )));
+        }
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+impl AsyncPing for GatedDestination {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+impl AsyncStream for GatedDestination {}
+
+// Session cancellation drops its split transport. Finish *TLS* closure, rather
+// than disguising a truncated TLS connection as a clean EOF in the regression.
+struct CleanTlsClose(Option<Box<dyn AsyncStream>>, bool);
+impl Drop for CleanTlsClose {
+    fn drop(&mut self) {
+        if let Some(mut transport) = self.0.take() {
+            if !self.1 {
+                return;
+            } // Deliberate truncated-TLS negative control.
+            tokio::spawn(async move {
+                timeout(Duration::from_secs(1), transport.shutdown())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+}
+impl AsyncRead for CleanTlsClose {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut **self.0.as_mut().unwrap()).poll_read(cx, b)
+    }
+}
+impl AsyncWrite for CleanTlsClose {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut **self.0.as_mut().unwrap()).poll_write(cx, b)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut **self.0.as_mut().unwrap()).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut **self.0.as_mut().unwrap()).poll_shutdown(cx)
+    }
+}
+impl AsyncPing for CleanTlsClose {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+impl AsyncStream for CleanTlsClose {}
+
+struct ObservedTransport {
+    inner: Box<dyn AsyncStream>,
+    eof: tokio_util::sync::CancellationToken,
+}
+impl AsyncRead for ObservedTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = b.filled().len();
+        let result = Pin::new(&mut *self.inner).poll_read(cx, b);
+        if matches!(result, Poll::Ready(Ok(()))) && b.filled().len() == before && b.remaining() > 0
+        {
+            self.eof.cancel();
+        }
+        result
+    }
+}
+impl AsyncWrite for ObservedTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn negotiated_clean_transport_eof_drains_accepted_upload_and_joins_relay() {
+    transport_eof_drain_case(DrainCase::AcceptedUpload).await;
+}
+
+#[tokio::test]
+async fn negotiated_transport_eof_joins_retired_reused_id_destination_shutdowns() {
+    transport_eof_drain_case(DrainCase::RetiredReusedId).await;
+}
+
+#[tokio::test]
+async fn negotiated_transport_eof_stalled_destination_is_bounded_failure() {
+    transport_eof_drain_case(DrainCase::Stalled).await;
+}
+
+#[tokio::test]
+async fn negotiated_transport_eof_cancellation_aborts_owned_drain() {
+    transport_eof_drain_case(DrainCase::Cancelled).await;
+}
+
+#[tokio::test]
+async fn negotiated_transport_eof_without_request_eof_is_not_graceful() {
+    transport_eof_drain_case(DrainCase::Incomplete).await;
+}
+
+#[tokio::test]
+async fn negotiated_truncated_tls_transport_is_not_graceful_drain() {
+    transport_eof_drain_case(DrainCase::TransportError).await;
+}
+
+#[tokio::test]
+async fn negotiated_retired_registry_does_not_hide_destination_shutdown_error() {
+    transport_eof_drain_case(DrainCase::DestinationError).await;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainCase {
+    AcceptedUpload,
+    RetiredReusedId,
+    Stalled,
+    Cancelled,
+    Incomplete,
+    TransportError,
+    DestinationError,
+}
+
+async fn transport_eof_drain_case(case: DrainCase) {
+    use super::anytls_server_session::AnyTlsSession;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tokio_util::sync::CancellationToken;
+    timeout(Duration::from_secs(15), async {
+        const U: usize = 9 * 1024 * 1024;
+        const R: usize = 256 * 1024;
+        const TAIL: usize = 128 * 1024;
+        let reused = case == DrainCase::RetiredReusedId;
+        let shutdown_gate = reused || case == DrainCase::DestinationError;
+        let partial = matches!(case, DrainCase::Stalled | DrainCase::Cancelled | DrainCase::Incomplete | DrainCase::TransportError);
+        let fails = partial || case == DrainCase::DestinationError;
+        let dest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dest.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let mut jobs = Vec::new();
+            for _ in 0..if reused { 2 } else { 1 } {
+                let (mut tcp, _) = dest.accept().await.unwrap();
+                jobs.push(tokio::spawn(async move {
+                    tcp.write_all(&vec![b'R'; R]).await.unwrap();
+                    tcp.shutdown().await.unwrap();
+                    let mut data = Vec::new();
+                    tcp.read_to_end(&mut data).await.unwrap();
+                    let expected = if partial { U - TAIL } else { U };
+                    eprintln!("interop regression case={case:?} destination bytes={} sha256={:?} genuine_eof=true expected={expected} expected_failure={fails}", data.len(), aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &data));
+                    assert_eq!(data.len(), expected, "accepted upload tail must survive graceful transport EOF");
+                    assert_eq!(blake3::hash(&data), blake3::hash(&vec![b'U'; expected]));
+                }));
+            }
+            for job in jobs { job.await.unwrap(); }
+        });
+        let gate = Arc::new(RelayGate {
+            remaining: AtomicUsize::new(if shutdown_gate { U } else { U - TAIL }),
+            blocked: CancellationToken::new(),
+            release: CancellationToken::new(),
+            hold_shutdown: shutdown_gate,
+            fail_shutdown: case == DrainCase::DestinationError,
+            shutdown_blocked: CancellationToken::new(),
+            release_shutdown: CancellationToken::new(),
+            wakers: std::array::from_fn(|_| futures::task::AtomicWaker::new()),
+            next_slot: AtomicUsize::new(0),
+        });
+        let transport_eof = CancellationToken::new();
+        let (client, mut server) = tls_pair().await;
+        let eof = transport_eof.clone();
+        let server_gate = gate.clone();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let (created, created_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            // Same authenticated TLS header emitted by the production client.
+            let mut hash = [0; 32];
+            server.read_exact(&mut hash).await.unwrap();
+            assert_eq!(&hash, aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"public-write-eof-test").as_ref());
+            let len = server.read_u16().await.unwrap();
+            server.read_exact(&mut vec![0; len as usize]).await.unwrap();
+            let session = AnyTlsSession::new_server_with_initial_data(
+                ObservedTransport { inner: server, eof }, PaddingFactory::default_factory(),
+                Arc::new(NativeResolver), direct_selector(), false, "public-test".into(), None,
+            );
+            session.enable_write_eof(true);
+            *session.relay_gate.lock().unwrap() = Some(server_gate);
+            created.send(session.clone()).unwrap_or_else(|_| panic!("test receiver closed"));
+            session.run_until_cancelled(Some(server_cancel)).await
+        });
+        let client = WriteEofClientSession::connect(
+            Box::new(CleanTlsClose(Some(client), case != DrainCase::TransportError)), "public-write-eof-test",
+            PaddingFactory::default_factory(), WriteEofOptions::default(),
+        ).await.unwrap();
+        let server = created_rx.await.unwrap();
+        let mut stream = client.open_stream(NetLocation::from_str(&addr.to_string(), None).unwrap()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, vec![b'R'; R]);
+        eprintln!("interop regression remote_eof_before_upload=true response_bytes={R}");
+        stream.write_all(&vec![b'U'; U]).await.unwrap();
+        if case == DrainCase::Incomplete {
+            stream.flush().await.unwrap();
+        } else {
+            stream.shutdown().await.unwrap();
+        }
+        if shutdown_gate {
+            gate.shutdown_blocked.cancelled().await;
+            assert_eq!(server.write_eof_resources_for_test(), (0, 7));
+        }
+        if reused {
+            assert_eq!(client.registered_streams(), 0);
+            client.reuse_id_for_test(stream.id());
+            gate.release.cancel();
+            let mut second = client.open_stream(NetLocation::from_str(&addr.to_string(), None).unwrap()).await.unwrap();
+            assert_eq!(second.id(), stream.id());
+            let mut response = Vec::new();
+            second.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, vec![b'R'; R]);
+            second.write_all(&vec![b'U'; U]).await.unwrap();
+            second.shutdown().await.unwrap();
+            assert_eq!(server.write_eof_resources_for_test().1, 6, "both retired-id relay handlers remain owned");
+            drop(second);
+        }
+        eprintln!("interop regression case={case:?} accepted_upload={U} ordered_write_eof_ack={} closing_transport_immediately=true", case != DrainCase::Incomplete);
+        client.close().await.unwrap();
+        drop(stream);
+        drop(client);
+        if !shutdown_gate { gate.blocked.cancelled().await; }
+        assert_eq!(gate.remaining.load(SeqCst), 0);
+        if case != DrainCase::TransportError { transport_eof.cancelled().await; }
+        let started = tokio::time::Instant::now();
+        if case == DrainCase::Cancelled { cancel.cancel(); }
+        if !fails || case == DrainCase::DestinationError {
+            assert!(!server_task.is_finished(), "wire retirement alone is not relay completion");
+            // No sleep, retry, client retention or application response after EOF.
+            gate.release.cancel();
+            gate.release_shutdown.cancel();
+            for waker in &gate.wakers { waker.wake(); }
+        }
+        let result = server_task.await.unwrap();
+        if fails {
+            let expected = match case {
+                DrainCase::Stalled => io::ErrorKind::TimedOut,
+                DrainCase::Cancelled => io::ErrorKind::Interrupted,
+                DrainCase::Incomplete => io::ErrorKind::BrokenPipe,
+                DrainCase::TransportError => io::ErrorKind::UnexpectedEof,
+                DrainCase::DestinationError => io::ErrorKind::BrokenPipe,
+                _ => unreachable!(),
+            };
+            assert_eq!(result.unwrap_err().kind(), expected);
+            assert!(started.elapsed() < if case == DrainCase::Stalled { Duration::from_secs(6) } else { Duration::from_secs(1) });
+            eprintln!("interop regression case={case:?} explicit_failure={expected:?} bounded=true");
+        } else { result.unwrap(); }
+        target.await.unwrap();
+        assert!(server.is_closed());
+        assert_eq!(server.write_eof_resources_for_test(), (0, 8));
+        eprintln!("interop regression actual_server_session_and_destination_settled=true");
+    }).await.unwrap();
+}
+
 #[tokio::test]
 async fn legacy_full_close_loses_delayed_response_control() {
     timeout(Duration::from_secs(20), async {

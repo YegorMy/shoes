@@ -171,6 +171,8 @@ pub(super) struct Registry {
     pub outgoing: mpsc::Sender<Operation>,
     eof_timeout: Duration,
     writing_id: AtomicU32,
+    // A reset/failed relay must not later look like successful empty retirement.
+    failed_retirement: AtomicBool,
 }
 impl Registry {
     #[cfg(test)]
@@ -186,6 +188,7 @@ impl Registry {
                 outgoing,
                 eof_timeout: eof_timeout.min(Duration::from_secs(5)),
                 writing_id: AtomicU32::new(0),
+                failed_retirement: AtomicBool::new(false),
             }),
             rx,
         )
@@ -193,6 +196,31 @@ impl Registry {
     pub fn close(&self) {
         self.cancel.cancel();
         self.streams.lock().clear();
+    }
+    pub fn fail_retirement(&self) {
+        self.failed_retirement.store(true, Ordering::SeqCst);
+    }
+    /// Only complete directional wire closure admits bounded relay draining.
+    /// This does not certify destination IO: the owning handlers must be joined.
+    pub fn transport_eof_timeout(&self) -> io::Result<Duration> {
+        if self.cancel.is_cancelled()
+            || self.failed_retirement.load(Ordering::SeqCst)
+            || self.streams.lock().values().any(|state| {
+                state.cancel.is_cancelled()
+                    || !state.local_eof.load(Ordering::SeqCst)
+                    || !state.remote_eof.load(Ordering::SeqCst)
+            })
+        {
+            return Err(closed());
+        }
+        Ok(self.eof_timeout)
+    }
+    pub fn finish_transport_eof(&self) -> io::Result<()> {
+        self.transport_eof_timeout()?;
+        if !self.streams.lock().is_empty() {
+            return Err(closed());
+        }
+        Ok(())
     }
     fn retire(&self, state: &DirectionState) {
         if state.local_eof.load(Ordering::SeqCst)
@@ -211,6 +239,7 @@ impl Registry {
     fn reset(&self, id: u32) {
         let state = self.streams.lock().remove(&id);
         if let Some(state) = state {
+            self.fail_retirement();
             state.cancel.cancel();
             if self.writing_id.load(Ordering::SeqCst) == id {
                 self.close();
@@ -218,6 +247,7 @@ impl Registry {
         }
     }
     fn reset_and_notify(&self, state: &DirectionState) {
+        self.fail_retirement();
         state.cancel.cancel();
         let removed = {
             let mut streams = self.streams.lock();
@@ -594,6 +624,10 @@ impl WriteEofClientSession {
         self.core.streams.lock().len()
     }
     #[cfg(test)]
+    pub(super) fn reuse_id_for_test(&self, id: u32) {
+        self.next_id.store(id - 1, Ordering::SeqCst);
+    }
+    #[cfg(test)]
     pub(super) async fn inject_frame_for_test(&self, frame: Frame) -> io::Result<()> {
         self.core.send(frame).await
     }
@@ -876,6 +910,44 @@ mod tests {
     use super::super::anytls_types::FrameCodec;
     use super::*;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn transport_eof_requires_both_directions_and_remembers_failed_retirement() {
+        let (core, _rx) = Registry::new(Duration::from_secs(5));
+        let (stream, _) = core.open(1, false).unwrap();
+        assert!(core.transport_eof_timeout().is_err());
+        stream.state.remote_eof.store(true, Ordering::SeqCst);
+        assert!(
+            core.transport_eof_timeout().is_err(),
+            "remote EOF alone is incomplete"
+        );
+        stream.state.local_eof.store(true, Ordering::SeqCst);
+        assert!(
+            core.transport_eof_timeout().is_ok(),
+            "complete wire EOF admits bounded drain"
+        );
+        assert!(
+            core.finish_transport_eof().is_err(),
+            "undrained receive queue is not retirement"
+        );
+        core.receive(Frame::control(Command::Fin, 1)).await.unwrap();
+        assert_eq!(core.stream_count_for_test(), 0);
+        assert!(
+            core.transport_eof_timeout().is_err(),
+            "full FIN is not graceful retirement"
+        );
+
+        let (core, _rx) = Registry::new(Duration::from_secs(5));
+        let (stream, _) = core.open(1, false).unwrap();
+        stream.state.local_eof.store(true, Ordering::SeqCst);
+        stream.state.remote_eof.store(true, Ordering::SeqCst);
+        stream.state.drained.store(true, Ordering::SeqCst);
+        core.retire(&stream.state);
+        assert!(core.finish_transport_eof().is_ok());
+        // Lost caller acknowledgement after wire retirement remains a failure.
+        core.reset_and_notify(&stream.state);
+        assert!(core.finish_transport_eof().is_err());
+    }
 
     #[test]
     fn codec_vectors_and_unambiguous_settings() {

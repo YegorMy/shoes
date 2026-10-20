@@ -22,7 +22,7 @@ data: `write-eof-public-test-only`.
 ```text
 write_eof_peer generate DIR
 write_eof_peer server LISTEN CERT KEY enabled|legacy TARGET [PUBLIC_TEST_PASSWORD]
-write_eof_peer client SERVER CA TARGET strict|legacy|legacy-bytes UPLOAD EXPECTED_RESPONSE [PUBLIC_TEST_PASSWORD]
+write_eof_peer client SERVER CA TARGET strict|strict-bytes|strict-first|legacy|legacy-bytes UPLOAD EXPECTED_RESPONSE [PUBLIC_TEST_PASSWORD]
 write_eof_peer target LISTEN EXPECTED_UPLOAD RESPONSE DELAY_MS
 write_eof_peer target-first LISTEN EXPECTED_UPLOAD RESPONSE DELAY_MS
 write_eof_peer target-length LISTEN EXPECTED_UPLOAD RESPONSE DELAY_MS
@@ -52,6 +52,20 @@ legacy forwarding control: no local shutdown is requested before receiving the
 response, and the destination reports `genuine_eof=false`. It is never the
 EOF-delimited-upload requirement or directional-EOF acceptance.
 
+`strict-bytes` plus `target-length` is the negotiated ordinary no-FIN control:
+it uses the production write-eof/1 API, writes and flushes the complete upload,
+and validates the full response and real response EOF **without local shutdown**.
+It reports `strict_no_shutdown=true request_eof=false`; full teardown is not proof
+of request EOF or directional settlement. It never substitutes `legacy-bytes`.
+
+`strict-first` plus `target-first` validates the complete response **and genuine
+response EOF before writing any upload**, then reports
+`remote_eof_before_upload=true`, uploads and awaits the actual ordered WRITE_EOF
+write/flush acknowledgement. It does not wait for an application response after
+that acknowledgement or retain the client to conceal server-side drain loss.
+For cross tests supply the public password `public-write-eof-test` and files
+containing `U` repeated 9,437,184 times / `R` repeated 262,144 times.
+
 ## Programmatic candidate APIs and budgets
 
 Existing constructors remain legacy. Opt in with
@@ -69,6 +83,14 @@ or unbounded extension channel. Each stream has at most one flush and one EOF
 acknowledgement; a client has exactly two session IO tasks and a server at most
 8 stream handlers. Normal retirement requires both write halves, settled writes
 and drained reads, and appends no full FIN.
+
+On clean transport EOF, only already complete negotiated directional wire EOF
+admits graceful relay settlement. A single EOF-only deadline (at most 5 seconds)
+covers draining accepted receive data and joining the actual destination relays,
+including TCP flush/shutdown after registry retirement. Retired wire ids do not
+alias still-settling handler tasks; the same eight-handler semaphore covers both.
+Incomplete EOF, reset, relay error, cancellation, truncated frames and drain
+deadline expiry remain failures/full closure, not successful graceful cleanup.
 
 Negotiation and EOF settlement default to 5 seconds; options may narrow, not widen,
 these bounds. Live write/flush has no new idle deadline. Timeout, cancellation or

@@ -200,7 +200,15 @@ async fn client(a: &[String]) -> io::Result<()> {
     }
     let target = addr(&a[2])?;
     let legacy_bytes = a[3] == "legacy-bytes";
-    let strict = if legacy_bytes { false } else { mode(&a[3])? };
+    let strict_bytes = a[3] == "strict-bytes";
+    let strict_first = a[3] == "strict-first";
+    let strict = if legacy_bytes {
+        false
+    } else if strict_bytes || strict_first {
+        true
+    } else {
+        mode(&a[3])?
+    };
     let upload = file(&a[4])?;
     let expected = file(&a[5])?;
     let password = test_password(a.get(6))?;
@@ -230,8 +238,19 @@ async fn client(a: &[String]) -> io::Result<()> {
         println!("negotiated=legacy");
         Box::new(session.open_stream(destination).await?)
     };
+    if strict_first {
+        validate_response(&mut *stream, &expected).await?;
+        println!("remote_eof_before_upload=true");
+    }
     stream.write_all(&upload).await?;
-    if legacy_bytes {
+    if strict_bytes {
+        stream.flush().await?;
+        println!(
+            "strict_no_shutdown=true request_eof=false upload_bytes={} upload_sha256={}",
+            upload.len(),
+            hash(&upload)
+        );
+    } else if legacy_bytes {
         stream.flush().await?;
         println!(
             "legacy_no_shutdown=true upload_bytes={} upload_sha256={}",
@@ -247,8 +266,15 @@ async fn client(a: &[String]) -> io::Result<()> {
             hash(&upload)
         );
     }
+    if !strict_first {
+        validate_response(&mut *stream, &expected).await?;
+    }
+    Ok(())
+}
+
+async fn validate_response(stream: &mut dyn AsyncStream, expected: &[u8]) -> io::Result<()> {
     let mut response = Vec::new();
-    (&mut *stream)
+    stream
         .take((expected.len() + 1) as u64)
         .read_to_end(&mut response)
         .await?;
@@ -345,7 +371,7 @@ async fn main() -> io::Result<()> {
             Some("target") if a.len()==5 => target(&a[1..],false,false).await,
             Some("target-first") if a.len()==5 => target(&a[1..],true,false).await,
             Some("target-length") if a.len()==5 => target(&a[1..],false,true).await,
-            _ => Err(failure("usage: generate DIR | server LISTEN CERT KEY enabled|legacy TARGET [PUBLIC_TEST_PASSWORD] | client SERVER CA TARGET strict|legacy|legacy-bytes UPLOAD EXPECTED [PUBLIC_TEST_PASSWORD] | target[-first|-length] LISTEN UPLOAD RESPONSE DELAY_MS")),
+            _ => Err(failure("usage: generate DIR | server LISTEN CERT KEY enabled|legacy TARGET [PUBLIC_TEST_PASSWORD] | client SERVER CA TARGET strict|strict-bytes|strict-first|legacy|legacy-bytes UPLOAD EXPECTED [PUBLIC_TEST_PASSWORD] | target[-first|-length] LISTEN UPLOAD RESPONSE DELAY_MS")),
         }
     }).await.map_err(|_| failure("fixture exceeded 60 second bound"))?
 }
