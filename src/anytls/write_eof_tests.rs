@@ -777,3 +777,69 @@ async fn negotiated_uot_preserves_setup_and_datagram_framing() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn unnegotiated_eof_fails_legacy_client_not_successful_eof() {
+    use super::anytls_types::*;
+    timeout(Duration::from_secs(5), async {
+        let (client, mut peer) = tls_pair().await;
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (inject, inject_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut auth = [0; 32];
+            peer.read_exact(&mut auth).await.unwrap();
+            let len = peer.read_u16().await.unwrap();
+            peer.read_exact(&mut vec![0; len as usize]).await.unwrap();
+            let settings = test_read_frame(&mut peer).await;
+            assert_eq!(settings.cmd, Command::Settings);
+            assert!(
+                StringMap::negotiation(&settings.data)
+                    .unwrap()
+                    .get("x-write-eof")
+                    .is_none()
+            );
+            let mut sid = 0;
+            loop {
+                let frame = test_read_frame(&mut peer).await;
+                if frame.cmd == Command::Syn {
+                    sid = frame.stream_id;
+                }
+                if frame.cmd == Command::Psh {
+                    assert_eq!(frame.stream_id, sid);
+                    break;
+                }
+            }
+            ready.send(()).unwrap();
+            inject_rx.await.unwrap();
+            peer.write_all(&Frame::control(Command::WriteEof, sid).encode())
+                .await
+                .unwrap();
+            peer.flush().await.unwrap();
+            let mut rest = Vec::new();
+            let _ = timeout(Duration::from_secs(1), peer.read_to_end(&mut rest))
+                .await
+                .expect("legacy client session must settle");
+        });
+        let session =
+            AnyTlsClientSession::new(client, "write-eof-test", PaddingFactory::default_factory())
+                .await
+                .unwrap();
+        let mut stream = session
+            .open_stream(NetLocation::from_str("127.0.0.1:1", None).unwrap())
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+        inject.send(()).unwrap();
+        assert_eq!(
+            stream.read(&mut [0; 1]).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(stream.write(b"late").await.is_err());
+        assert!(stream.flush().await.is_err());
+        assert!(stream.shutdown().await.is_err());
+        assert!(stream.shutdown().await.is_err());
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}

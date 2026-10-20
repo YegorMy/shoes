@@ -54,6 +54,8 @@ pub struct AnyTlsClientSession {
 
     /// Session state
     is_closed: Arc<AtomicBool>,
+    /// Private extension traffic on a legacy session is a fatal protocol error.
+    protocol_failed: Arc<AtomicBool>,
 
     /// Padding configuration
     padding: Arc<PaddingFactory>,
@@ -131,6 +133,7 @@ impl AnyTlsClientSession {
             stream_id_counter: AtomicU32::new(0),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
+            protocol_failed: Arc::new(AtomicBool::new(false)),
             padding: Arc::clone(&padding),
             peer_version: AtomicU8::new(1), // Assume v1 until server confirms v2
             pending_opens: Mutex::new(HashMap::new()),
@@ -221,10 +224,16 @@ impl AnyTlsClientSession {
         // Writer task - handles all outgoing messages (control and data)
         let session_weak_w = Arc::downgrade(&session);
         let close_notify_w = Arc::clone(&session.close_notify);
+        let closed_w = session.is_closed.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w).await
-            {
+            if closed_w.load(Ordering::SeqCst) {
+                return;
+            }
+            let result = tokio::select! {
+                _ = close_notify_w.notified() => Ok(()),
+                result = Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w.clone()) => result,
+            };
+            if let Err(e) = result {
                 log::debug!("AnyTLS client writer ended: {}", e);
             }
         });
@@ -535,6 +544,16 @@ impl AnyTlsClientSession {
     /// Handle a received frame
     async fn handle_frame(&self, frame: Frame) -> io::Result<()> {
         match frame.cmd {
+            Command::WriteEof => {
+                self.protocol_failed.store(true, Ordering::SeqCst);
+                self.is_closed.store(true, Ordering::SeqCst);
+                // Retain a permit if the writer has not started yet; cancel even
+                // a writer blocked inside transport IO, not just queue receive.
+                self.close_notify.notify_one();
+                self.streams.write().await.clear();
+                self.pending_opens.lock().await.clear();
+                return Err(super::write_eof::protocol_error());
+            }
             Command::Psh => {
                 // Data for a stream
                 if frame.data.is_empty() {
@@ -795,13 +814,14 @@ impl AnyTlsClientSession {
         });
 
         // Create stream wrapper with session keepalive reference
-        let stream = AnyTlsStream::with_keepalive(
+        let mut stream = AnyTlsStream::with_keepalive(
             stream_id,
             data_rx,
             stream_write_tx,
             Arc::clone(&self.is_closed),
             Arc::clone(self),
         );
+        stream.fail_on_protocol_error(self.protocol_failed.clone());
 
         Ok(stream)
     }

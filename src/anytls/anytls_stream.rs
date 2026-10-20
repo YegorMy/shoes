@@ -44,6 +44,7 @@ const MAX_FRAME_DATA_SIZE: usize = 65535;
 pub struct AnyTlsStream {
     /// Present only after explicit write-eof/1 agreement. Legacy fields stay idle.
     write_eof: Option<super::write_eof::EofStream>,
+    fatal_protocol: Option<Arc<AtomicBool>>,
     /// Stream ID (unique within session)
     id: u32,
 
@@ -96,6 +97,7 @@ impl AnyTlsStream {
     ) -> Self {
         Self {
             write_eof: None,
+            fatal_protocol: None,
             id,
             data_rx,
             read_buffer: Bytes::new(),
@@ -122,6 +124,7 @@ impl AnyTlsStream {
     ) -> Self {
         Self {
             write_eof: None,
+            fatal_protocol: None,
             id,
             data_rx,
             read_buffer: Bytes::new(),
@@ -138,6 +141,24 @@ impl AnyTlsStream {
     /// Get the stream ID
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    pub(super) fn fail_on_protocol_error(&mut self, flag: Arc<AtomicBool>) {
+        self.fatal_protocol = Some(flag);
+    }
+    fn check_protocol_failure(&self) -> io::Result<()> {
+        if self
+            .fatal_protocol
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AnyTLS session protocol failure",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn from_write_eof(stream: super::write_eof::EofStream) -> Self {
@@ -174,6 +195,7 @@ impl AsyncRead for AnyTlsStream {
         if let Some(stream) = &mut self.write_eof {
             return Pin::new(stream).poll_read(cx, buf);
         }
+        self.check_protocol_failure()?;
         // Check if stream/session is closed
         if self.stream_closed {
             return Poll::Ready(Err(io::Error::new(
@@ -297,6 +319,7 @@ impl AsyncWrite for AnyTlsStream {
         if let Some(stream) = &mut self.write_eof {
             return Pin::new(stream).poll_flush(_cx);
         }
+        self.check_protocol_failure()?;
         // Data is sent through channels, actual flushing happens in process_outgoing
         Poll::Ready(Ok(()))
     }
@@ -305,6 +328,7 @@ impl AsyncWrite for AnyTlsStream {
         if let Some(stream) = &mut self.write_eof {
             return Pin::new(stream).poll_shutdown(cx);
         }
+        self.check_protocol_failure()?;
         // Already fully closed
         if self.stream_closed {
             return Poll::Ready(Ok(()));
