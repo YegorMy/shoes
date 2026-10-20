@@ -373,6 +373,8 @@ impl Registry {
                     } else {
                         Err(closed())
                     });
+                } else if !frame.data.is_empty() {
+                    self.reset(frame.stream_id);
                 }
             }
             _ => return Err(protocol_error()),
@@ -687,7 +689,11 @@ impl WriteEofClientSession {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| error(WriteEofError::Capacity))?
             + 1;
-        let (mut stream, synack) = self.core.open(id, true)?;
+        // UoT requires its ordinary setup header AFTER the magic destination and
+        // BEFORE SYNACK. Feature agreement is already complete, independently.
+        let uot_setup = matches!(destination.address(), crate::address::Address::Hostname(host)
+            if host == crate::uot::UOT_V1_MAGIC_ADDRESS || host == crate::uot::UOT_V2_MAGIC_ADDRESS);
+        let (mut stream, synack) = self.core.open(id, !uot_setup)?;
         // Stream's Drop is the cancellation guard even while SYN/SYNACK is pending.
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             self.core
@@ -699,11 +705,15 @@ impl WriteEofClientSession {
                     Frame::data(id, Bytes::from(write_location_to_vec(&destination))),
                 )
                 .await?;
-            tokio::select! {
-                biased;
-                _ = self.core.cancel.cancelled() => Err(closed()),
-                _ = stream.state.cancel.cancelled() => Err(closed()),
-                result = synack.unwrap() => result.unwrap_or_else(|_| Err(closed())),
+            if let Some(synack) = synack {
+                tokio::select! {
+                    biased;
+                    _ = self.core.cancel.cancelled() => Err(closed()),
+                    _ = stream.state.cancel.cancelled() => Err(closed()),
+                    result = synack => result.unwrap_or_else(|_| Err(closed())),
+                }
+            } else {
+                Ok(())
             }
         })
         .await

@@ -196,13 +196,17 @@ async fn absent_shutdown_does_not_deliver_destination_eof_control() {
 }
 
 async fn enabled_transport(enabled: bool) -> Box<dyn AsyncStream> {
+    enabled_transport_with_udp(enabled, false).await
+}
+
+async fn enabled_transport_with_udp(enabled: bool, udp: bool) -> Box<dyn AsyncStream> {
     let (client, server) = tls_pair().await;
     let handler = AnyTlsServerHandler::new(
         vec![("public-test".into(), "write-eof-test".into())],
         PaddingFactory::default_factory(),
         Arc::new(NativeResolver),
         direct_selector(),
-        false,
+        udp,
         None,
     )
     .with_write_eof(enabled);
@@ -725,6 +729,50 @@ async fn unnegotiated_eof_fails_real_authenticated_tls_session() {
         while let Some(frame) = FrameCodec::decode(&mut data).unwrap() {
             assert_ne!(frame.cmd, Command::WriteEof);
         }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn negotiated_uot_preserves_setup_and_datagram_framing() {
+    use crate::tcp::tcp_handler::TcpClientHandler;
+    timeout(Duration::from_secs(5), async {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = NetLocation::from_str(&udp.local_addr().unwrap().to_string(), None).unwrap();
+        let echo = tokio::spawn(async move {
+            let mut data = [0; 64];
+            let (n, from) = udp.recv_from(&mut data).await.unwrap();
+            assert_eq!(&data[..n], b"datagram");
+            udp.send_to(&data[..n], from).await.unwrap();
+        });
+        let handler = AnyTlsClientHandler::new(
+            "write-eof-test".into(),
+            PaddingFactory::default_factory(),
+            true,
+        )
+        .require_write_eof(WriteEofOptions::default());
+        let mut stream = handler
+            .setup_client_udp_bidirectional(
+                enabled_transport_with_udp(true, true).await,
+                target.into(),
+            )
+            .await
+            .unwrap();
+        futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, b"datagram"))
+            .await
+            .unwrap();
+        futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+        let mut data = [0; 64];
+        let mut buf = ReadBuf::new(&mut data);
+        futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_read_message(cx, &mut buf))
+            .await
+            .unwrap();
+        assert_eq!(buf.filled(), b"datagram");
+        echo.await.unwrap();
+        eprintln!("real TLS strict UoT setup/datagram bytes=8 framing unchanged");
     })
     .await
     .unwrap();
