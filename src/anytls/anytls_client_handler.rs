@@ -28,6 +28,7 @@ use crate::vless::VlessMessageStream;
 /// opens multiplexed streams to destinations, and supports UDP-over-TCP via UoT magic addresses.
 #[derive(Clone)]
 pub struct AnyTlsClientHandler {
+    write_eof: Option<super::WriteEofOptions>,
     /// Authentication password
     password: String,
     /// Padding factory for traffic obfuscation
@@ -48,9 +49,37 @@ impl AnyTlsClientHandler {
     /// Create a new AnyTLS client handler
     pub fn new(password: String, padding: Arc<PaddingFactory>, udp_enabled: bool) -> Self {
         Self {
+            write_eof: None,
             password,
             padding,
             udp_enabled,
+        }
+    }
+
+    /// Require explicit write-eof/1 agreement; never downgrade to legacy FIN.
+    pub fn require_write_eof(mut self, options: super::WriteEofOptions) -> Self {
+        self.write_eof = Some(options);
+        self
+    }
+
+    async fn open(
+        &self,
+        transport: Box<dyn AsyncStream>,
+        destination: NetLocation,
+    ) -> std::io::Result<super::AnyTlsStream> {
+        if let Some(options) = self.write_eof {
+            let session = super::WriteEofClientSession::connect(
+                transport,
+                &self.password,
+                self.padding.clone(),
+                options,
+            )
+            .await?;
+            session.open_stream(destination).await
+        } else {
+            let session =
+                AnyTlsClientSession::new(transport, &self.password, self.padding.clone()).await?;
+            session.open_stream(destination).await
         }
     }
 }
@@ -62,11 +91,9 @@ impl TcpClientHandler for AnyTlsClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let session =
-            AnyTlsClientSession::new(client_stream, &self.password, Arc::clone(&self.padding))
-                .await?;
-
-        let stream = session.open_stream(remote_location.into_location()).await?;
+        let stream = self
+            .open(client_stream, remote_location.into_location())
+            .await?;
 
         Ok(TcpClientSetupResult {
             client_stream: Box::new(stream),
@@ -90,13 +117,9 @@ impl TcpClientHandler for AnyTlsClientHandler {
             ));
         }
 
-        let session =
-            AnyTlsClientSession::new(client_stream, &self.password, Arc::clone(&self.padding))
-                .await?;
-
         // UoT V2 Connect Mode: single destination via magic address
         let uot_dest = NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0);
-        let mut stream = session.open_stream(uot_dest).await?;
+        let mut stream = self.open(client_stream, uot_dest).await?;
 
         // UoT V2 header: isConnect(1) + destination
         stream.write_u8(1).await?;

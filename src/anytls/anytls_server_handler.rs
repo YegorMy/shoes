@@ -32,6 +32,7 @@ use aws_lc_rs::digest::{SHA256, digest};
 /// and runs the session which handles all streams internally.
 #[derive(Debug)]
 pub struct AnyTlsServerHandler {
+    write_eof_enabled: bool,
     /// Authenticated users (password_hash -> user name)
     users: HashMap<[u8; 32], String>,
     /// 8-byte prefixes of all user password hashes for quick fallback.
@@ -85,6 +86,7 @@ impl AnyTlsServerHandler {
         }
 
         Self {
+            write_eof_enabled: false,
             users: user_map,
             hash_prefixes,
             padding,
@@ -93,6 +95,12 @@ impl AnyTlsServerHandler {
             udp_enabled,
             fallback,
         }
+    }
+
+    /// Explicit private development-extension policy. Defaults to disabled.
+    pub fn with_write_eof(mut self, enabled: bool) -> Self {
+        self.write_eof_enabled = enabled;
+        self
     }
 }
 
@@ -213,6 +221,7 @@ impl AnyTlsServerHandler {
             user_name,
             initial_data,
         );
+        session.enable_write_eof(self.write_eof_enabled);
 
         // Run the session in a background task
         tokio::spawn(async move {

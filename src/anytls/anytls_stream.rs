@@ -42,6 +42,8 @@ const MAX_FRAME_DATA_SIZE: usize = 65535;
 /// Uses bounded channels with backpressure to prevent OOM during
 /// speed-mismatched transfers.
 pub struct AnyTlsStream {
+    /// Present only after explicit write-eof/1 agreement. Legacy fields stay idle.
+    write_eof: Option<super::write_eof::EofStream>,
     /// Stream ID (unique within session)
     id: u32,
 
@@ -93,6 +95,7 @@ impl AnyTlsStream {
         session_closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            write_eof: None,
             id,
             data_rx,
             read_buffer: Bytes::new(),
@@ -118,6 +121,7 @@ impl AnyTlsStream {
         session: Arc<S>,
     ) -> Self {
         Self {
+            write_eof: None,
             id,
             data_rx,
             read_buffer: Bytes::new(),
@@ -134,6 +138,16 @@ impl AnyTlsStream {
     /// Get the stream ID
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    pub(super) fn from_write_eof(stream: super::write_eof::EofStream) -> Self {
+        let id = stream.id();
+        let (_, rx) = mpsc::channel(1);
+        let (tx, _) = mpsc::channel(1);
+        let mut wrapper = Self::new(id, rx, tx, Arc::new(AtomicBool::new(false)));
+        wrapper.stream_closed = true; // never run the legacy Drop/FIN path
+        wrapper.write_eof = Some(stream);
+        wrapper
     }
 
     /// Best-effort FIN send for Drop (cannot block in Drop)
@@ -157,6 +171,9 @@ impl AsyncRead for AnyTlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Some(stream) = &mut self.write_eof {
+            return Pin::new(stream).poll_read(cx, buf);
+        }
         // Check if stream/session is closed
         if self.stream_closed {
             return Poll::Ready(Err(io::Error::new(
@@ -222,6 +239,9 @@ impl AsyncWrite for AnyTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(stream) = &mut self.write_eof {
+            return Pin::new(stream).poll_write(cx, buf);
+        }
         if self.stream_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -273,12 +293,18 @@ impl AsyncWrite for AnyTlsStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(stream) = &mut self.write_eof {
+            return Pin::new(stream).poll_flush(_cx);
+        }
         // Data is sent through channels, actual flushing happens in process_outgoing
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(stream) = &mut self.write_eof {
+            return Pin::new(stream).poll_shutdown(cx);
+        }
         // Already fully closed
         if self.stream_closed {
             return Poll::Ready(Ok(()));

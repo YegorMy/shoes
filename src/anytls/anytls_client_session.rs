@@ -167,7 +167,7 @@ impl AnyTlsClientSession {
     }
 
     /// Send authentication frame
-    async fn send_auth(
+    pub(super) async fn send_auth(
         transport: &mut Box<dyn AsyncStream>,
         password_hash: &[u8; 32],
         padding: &PaddingFactory,

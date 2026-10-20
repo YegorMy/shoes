@@ -34,6 +34,8 @@ pub enum Command {
     HeartResponse = 9,
     /// Server settings sent to client (protocol v2)
     ServerSettings = 10,
+    /// Private write-eof/1 development extension. Never valid without agreement.
+    WriteEof = 240,
 }
 
 impl TryFrom<u8> for Command {
@@ -52,6 +54,7 @@ impl TryFrom<u8> for Command {
             8 => Ok(Command::HeartRequest),
             9 => Ok(Command::HeartResponse),
             10 => Ok(Command::ServerSettings),
+            240 => Ok(Command::WriteEof),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown command: {}", value),
@@ -149,6 +152,25 @@ impl StringMap {
             }
         }
         map
+    }
+
+    /// Negotiation must not manufacture agreement through lossy UTF-8 or duplicate keys.
+    pub fn negotiation(data: &[u8]) -> io::Result<Self> {
+        let text = std::str::from_utf8(data).map_err(|_| super::write_eof::negotiation_error())?;
+        let mut map = Self::new();
+        for line in text.split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(super::write_eof::negotiation_error)?;
+            if map.0.contains_key(key) {
+                return Err(super::write_eof::negotiation_error());
+            }
+            map.insert(key, value);
+        }
+        Ok(map)
     }
 
     /// Serialize to bytes

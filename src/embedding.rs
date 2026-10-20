@@ -16,6 +16,36 @@ use crate::address::NetLocation;
 use crate::config::Config;
 use crate::resolver::Resolver;
 
+// Programmatic opt-in only: no config defaults, consumer pins, or listeners change.
+pub use crate::anytls::{
+    AnyTlsClientHandler, AnyTlsClientSession, AnyTlsServerHandler, AnyTlsStream, PaddingFactory,
+    WriteEofClientSession, WriteEofError, WriteEofOptions,
+};
+
+/// Construct an AnyTLS handler on an embedder-owned authenticated TLS transport.
+/// The outbound chain and optional hooks are explicit, just as for existing servers.
+/// `write_eof_enabled` opts into the private development extension, not standard v3.
+pub fn anytls_server_handler(
+    users: Vec<(String, String)>,
+    padding: Arc<PaddingFactory>,
+    resolver: Arc<dyn Resolver>,
+    outbound: crate::client_proxy_chain::ClientChainGroup,
+    hooks: Option<Arc<dyn ServerHooks>>,
+    write_eof_enabled: bool,
+) -> AnyTlsServerHandler {
+    use crate::address::NetLocationMask;
+    use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+    let mut policy = ClientProxySelector::new(vec![ConnectRule::new(
+        vec![NetLocationMask::ANY],
+        ConnectAction::new_allow(None, outbound),
+    )]);
+    if let Some(hooks) = hooks {
+        policy = policy.with_hooks(hooks);
+    }
+    AnyTlsServerHandler::new(users, padding, resolver, Arc::new(policy), false, None)
+        .with_write_eof(write_eof_enabled)
+}
+
 /// Like [`crate::tcp::tcp_server::start_servers`], with `hooks` installed on
 /// every listener the config starts. Hooks are supported for TCP transport
 /// servers; TUN and QUIC configs are refused with `ErrorKind::Unsupported`.

@@ -3,6 +3,9 @@
 //! A Session manages multiple Streams over a single TLS connection,
 //! handling framing, multiplexing, padding, and stream routing.
 
+use super::write_eof::{
+    FEATURE, MAX_STREAMS, Operation, Registry, WriteEofOptions, protocol_error,
+};
 use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
@@ -23,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +42,11 @@ const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
+    write_eof_enabled: AtomicBool,
+    write_eof_agreed: AtomicBool,
+    write_eof: Arc<Registry>,
+    write_eof_rx: Mutex<mpsc::Receiver<Operation>>,
+    write_eof_handler_slots: Arc<Semaphore>,
     /// Underlying connection (split into reader/writer)
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -117,8 +125,14 @@ impl AnyTlsSession {
         // Use bounded channel for outgoing data to provide backpressure
         // Buffer size is per-session, shared across all streams
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
+        let (write_eof, write_eof_rx) = Registry::new(WriteEofOptions::default().eof_timeout);
 
         Arc::new(Self {
+            write_eof_enabled: AtomicBool::new(false),
+            write_eof_agreed: AtomicBool::new(false),
+            write_eof,
+            write_eof_rx: Mutex::new(write_eof_rx),
+            write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -160,6 +174,7 @@ impl AnyTlsSession {
         let (reader, writer) = tokio::io::split(conn);
         // Use bounded channel for outgoing data to provide backpressure
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
+        let (write_eof, write_eof_rx) = Registry::new(WriteEofOptions::default().eof_timeout);
 
         // Create a "block all" proxy selector - tests that need real routing should
         // use the full constructor with proper dependencies
@@ -169,6 +184,11 @@ impl AnyTlsSession {
         )]));
 
         Arc::new(Self {
+            write_eof_enabled: AtomicBool::new(false),
+            write_eof_agreed: AtomicBool::new(false),
+            write_eof,
+            write_eof_rx: Mutex::new(write_eof_rx),
+            write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -198,6 +218,11 @@ impl AnyTlsSession {
         self.is_closed.load(Ordering::Relaxed)
     }
 
+    /// Set before run; does not change behavior for clients without the exact offer.
+    pub(super) fn enable_write_eof(&self, enabled: bool) {
+        self.write_eof_enabled.store(enabled, Ordering::SeqCst);
+    }
+
     /// Close the session
     pub async fn close(&self) {
         if self
@@ -205,6 +230,7 @@ impl AnyTlsSession {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
+            self.write_eof.close();
             // Abort all active stream handler tasks first
             // This prevents memory leaks from hung tasks holding Arc<Self>
             {
@@ -248,35 +274,50 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let session = Arc::clone(self);
 
-        // Start the outgoing data processor
-        let session_clone = Arc::clone(&session);
-        let outgoing_task = tokio::spawn(async move {
-            session_clone.process_outgoing().await;
-        });
-
         // Run the receive loop. Cancellation is checked first, so a session
         // cancelled before or while it runs handles no further frames.
         let result = match cancel {
             Some(cancel) => tokio::select! {
                 biased;
                 () = cancel.cancelled() => Ok(()),
+                () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
+                result = session.process_outgoing() => result,
                 result = session.recv_loop() => result,
             },
-            None => session.recv_loop().await,
+            None => tokio::select! {
+                () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
+                result = session.process_outgoing() => result,
+                result = session.recv_loop() => result,
+            },
         };
 
         // Cleanup
         session.close().await;
-        outgoing_task.abort();
 
         result
     }
 
     /// Process outgoing data from streams
-    async fn process_outgoing(&self) {
+    async fn process_outgoing(&self) -> io::Result<()> {
         let mut rx = self.outgoing_rx.lock().await;
+        let mut eof_rx = self.write_eof_rx.lock().await;
 
-        while let Some((stream_id, data)) = rx.recv().await {
+        loop {
+            let legacy = tokio::select! {
+                op = eof_rx.recv() => {
+                    let Some(op) = op else { return Err(protocol_error()); };
+                    if !op.begin(&self.write_eof) { op.finish(&self.write_eof, Err(protocol_error())); continue; }
+                    let result = if let Some(frame) = &op.frame { self.write_frame(frame).await } else { self.writer.lock().await.flush().await };
+                    let failed = result.is_err();
+                    op.finish(&self.write_eof, result);
+                    if failed { return Err(protocol_error()); }
+                    continue;
+                }
+                legacy = rx.recv() => legacy,
+            };
+            let Some((stream_id, data)) = legacy else {
+                return Ok(());
+            };
             if self.is_closed() {
                 break;
             }
@@ -301,6 +342,7 @@ impl AnyTlsSession {
                 }
             }
         }
+        Ok(())
     }
 
     /// Main receive loop - reads frames and dispatches them
@@ -341,7 +383,16 @@ impl AnyTlsSession {
 
     /// Handle a received frame
     async fn handle_frame(self: &Arc<Self>, frame: Frame) -> io::Result<()> {
+        if frame.cmd == Command::WriteEof && !self.write_eof_agreed.load(Ordering::SeqCst) {
+            return Err(protocol_error());
+        }
+        if self.write_eof_agreed.load(Ordering::SeqCst)
+            && matches!(frame.cmd, Command::Psh | Command::Fin | Command::WriteEof)
+        {
+            return self.write_eof.receive(frame).await;
+        }
         match frame.cmd {
+            Command::WriteEof => return Err(protocol_error()),
             Command::Psh => {
                 // Skip zero-length PSH frames (matches reference implementation)
                 if frame.data.is_empty() {
@@ -389,6 +440,44 @@ impl AnyTlsSession {
                 }
 
                 let stream_id = frame.stream_id;
+
+                if self.write_eof_agreed.load(Ordering::SeqCst) {
+                    // Includes handlers between wire retirement and final cleanup,
+                    // even if a peer immediately reuses a retired stream id.
+                    let permit = self
+                        .write_eof_handler_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| protocol_error())?;
+                    let (stream, _) = self.write_eof.open(stream_id, false)?;
+                    let stream = AnyTlsStream::from_write_eof(stream);
+                    let session = self.clone();
+                    let mut tasks = self.stream_tasks.lock().await;
+                    tasks.retain(|_, task| !task.is_finished());
+                    if tasks.len() >= MAX_STREAMS {
+                        return Err(protocol_error());
+                    }
+                    if let Some(retired) = tasks.remove(&stream_id) {
+                        // Registry::open already proved the old wire stream retired.
+                        // Do not detach its cleanup or let it remove the new task.
+                        retired.abort();
+                    }
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
+                        // No new whole-live-stream timeout. EOF settlement has its
+                        // own bounded timer in the negotiated stream, not in relay IO.
+                        let _ = session.handle_new_stream(stream).await;
+                        let mut tasks = session.stream_tasks.lock().await;
+                        if tasks
+                            .get(&stream_id)
+                            .is_some_and(|task| task.id() == tokio::task::id())
+                        {
+                            tasks.remove(&stream_id);
+                        }
+                    });
+                    tasks.insert(stream_id, handle);
+                    return Ok(());
+                }
 
                 // Check if stream already exists and register atomically
                 // This prevents race conditions with duplicate SYNs
@@ -506,9 +595,19 @@ impl AnyTlsSession {
                     return Ok(());
                 }
 
+                let enabled = self.write_eof_enabled.load(Ordering::SeqCst);
+                if enabled
+                    && (frame.stream_id != 0
+                        || self.received_client_settings.load(Ordering::SeqCst))
+                {
+                    return Err(protocol_error());
+                }
+                let settings = if enabled {
+                    StringMap::negotiation(&frame.data)?
+                } else {
+                    StringMap::from_bytes(&frame.data)
+                };
                 self.received_client_settings.store(true, Ordering::Relaxed);
-
-                let settings = StringMap::from_bytes(&frame.data);
 
                 // Check padding-md5
                 if settings
@@ -535,6 +634,13 @@ impl AnyTlsSession {
                     // Send server settings
                     let mut server_settings = StringMap::new();
                     server_settings.insert("v", "2");
+                    if enabled
+                        && settings.get("v").map(String::as_str) == Some("2")
+                        && settings.get(FEATURE).map(String::as_str) == Some("1")
+                    {
+                        server_settings.insert(FEATURE, "1");
+                        self.write_eof_agreed.store(true, Ordering::SeqCst);
+                    }
                     let settings_frame = Frame::with_data(
                         Command::ServerSettings,
                         0,
@@ -1031,6 +1137,103 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn write_eof_negotiation_enable_offer_and_protocol_guards() {
+        for enabled in [false, true] {
+            for offer in [None, Some("0"), Some("2"), Some("1")] {
+                let (transport, mut peer) = duplex(8192);
+                let session =
+                    AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+                session.enable_write_eof(enabled);
+                let mut settings = StringMap::new();
+                settings.insert("v", "2");
+                settings.insert("padding-md5", session.padding.md5());
+                if let Some(offer) = offer {
+                    settings.insert(FEATURE, offer);
+                }
+                session
+                    .handle_frame(Frame::with_data(
+                        Command::Settings,
+                        0,
+                        Bytes::from(settings.to_bytes()),
+                    ))
+                    .await
+                    .unwrap();
+                let mut wire = [0; 256];
+                let count = peer.read(&mut wire).await.unwrap();
+                let frame = FrameCodec::decode(&mut BytesMut::from(&wire[..count]))
+                    .unwrap()
+                    .unwrap();
+                let response = StringMap::negotiation(&frame.data).unwrap();
+                assert_eq!(
+                    response.get(FEATURE).is_some(),
+                    enabled && offer == Some("1")
+                );
+                let eof = Frame::control(Command::WriteEof, 1);
+                if enabled && offer == Some("1") {
+                    session.handle_frame(eof).await.unwrap(); // unknown id ignored, no allocation
+                    assert!(session.write_eof.stream_count_for_test() == 0);
+                    assert!(
+                        session
+                            .handle_frame(Frame::control(Command::WriteEof, 0))
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        session
+                            .handle_frame(Frame::with_data(
+                                Command::WriteEof,
+                                1,
+                                Bytes::from_static(b"x")
+                            ))
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    assert!(session.handle_frame(eof).await.is_err());
+                }
+                session.close().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_eof_server_rejects_ambiguous_or_conflicting_settings() {
+        for data in [
+            b"v=2\nx-write-eof=1\nx-write-eof=1".as_slice(),
+            b"v=2\nx-write-eof=0\nx-write-eof=1",
+            b"v=2\nx-write-eof=1\nbad=\xff",
+        ] {
+            let (transport, _peer) = duplex(8192);
+            let session =
+                AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+            session.enable_write_eof(true);
+            assert!(
+                session
+                    .handle_frame(Frame::with_data(
+                        Command::Settings,
+                        0,
+                        Bytes::copy_from_slice(data)
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert!(!session.write_eof_agreed.load(Ordering::SeqCst));
+            session.close().await;
+        }
+        let (transport, _peer) = duplex(8192);
+        let session = AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+        session.enable_write_eof(true);
+        let offer = Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from_static(b"v=2\nx-write-eof=1"),
+        );
+        session.handle_frame(offer.clone()).await.unwrap();
+        assert!(session.handle_frame(offer).await.is_err());
+        session.close().await;
+    }
 
     #[tokio::test]
     async fn test_session_creation() {
