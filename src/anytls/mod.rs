@@ -16,3 +16,6 @@ mod anytls_types;
 pub use anytls_client_handler::AnyTlsClientHandler;
 pub use anytls_padding::PaddingFactory;
 pub use anytls_server_handler::AnyTlsServerHandler;
+
+#[cfg(test)]
+mod write_eof_tests;
