@@ -429,6 +429,12 @@ async fn transport_eof_drain_case(case: DrainCase) {
         } else {
             stream.shutdown().await.unwrap();
         }
+        if partial {
+            // Transport flush/EOF ACK does not establish destination delivery.
+            // Reach the exact negative prefix before full failure can cancel it.
+            gate.blocked.cancelled().await;
+            assert_eq!(gate.remaining.load(SeqCst), 0);
+        }
         if shutdown_gate {
             gate.shutdown_blocked.cancelled().await;
             assert_eq!(server.write_eof_resources_for_test(), (0, 7));
