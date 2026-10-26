@@ -3,13 +3,18 @@
 Rustls 0.23.45 is copied from the published crate at source commit
 2976d90fd1c2db6b518700dd101b714069cfcb17. All original licenses are retained.
 RUSTLS-UPSTREAM-SHA256.json identifies the 119 original files;
-RUSTLS-PATCH-IDENTITY.json identifies the four changed source files.
+RUSTLS-PATCH-IDENTITY.json identifies every changed source file.
 
 The optional client session-ID callback receives encoded ClientHello bytes
 before transcript hashing. Only the session ID changes; the stored expected
 echo also changes. Default configurations do not install this callback.
 It disables resumption and early data, and refuses ECH, QUIC and retry
 handshakes. Cipher suites, verification, signatures and key schedules are unchanged.
+
+Server and client diagnostics never format handshake messages, server
+names, certificates, OCSP responses, tickets, ALPN names, CertificateRequest
+contents or ECH configurations. They keep their levels and report bounded
+progress, counts and outcomes. The ALPN-only `bs_debug` helper is test-only.
 
 Shoes keeps ShadowTLS v3 session-ID HMAC and record framing. The client
 authenticates/unwraps each server handshake record, gives its TLS ciphertext

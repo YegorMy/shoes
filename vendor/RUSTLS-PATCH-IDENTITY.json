@@ -18,14 +18,64 @@
       "patched": "ef9e8b66b12287c8b39574f3efa4156a971f0dc97d2bcb5fd54ba4a578776e0d"
     },
     {
+      "path": "src/client/ech.rs",
+      "original": "267a66863904acef533de53562ef4bbb919f8e757392e41d7400e3325b601eb3",
+      "patched": "0b4a98944652aaf36eb44754470ae45fbadcf7b3bb6b3d749f49e24133f47e89"
+    },
+    {
       "path": "src/client/hs.rs",
       "original": "db78250533e2639401fa05a7e63ed2172aea9e38558a767deecf140dfbe03afe",
-      "patched": "4b0a77d1dacde68106e6b4c94063d7915f056b1215653c87bc6ccdb2a3d646de"
+      "patched": "61ac0fc72f7a0833fa57bec7b543b4855ed7d794b31bc74c3510622b5b45ca53"
+    },
+    {
+      "path": "src/client/tls12.rs",
+      "original": "169295b363f745d24a7887521f6055161e40a2e91612bf0d1b92645062d9a8d3",
+      "patched": "ab2e28c284e359e4a85c2cfcd2b7eb7dfe1db5a7f7f932f0e1b3d8d5bc0f2244"
+    },
+    {
+      "path": "src/client/tls13.rs",
+      "original": "f49fab299541467c377fabbef5f12f07472370be348aa18159e268bcd2c698fa",
+      "patched": "ea75ecf46c412c44d411057968977ef0b9211fb35541186a51fe6ae57e3605ff"
+    },
+    {
+      "path": "src/lib.rs",
+      "original": "7bd4855fe9628a0d596e89edf8130a6c099a14a0b7f7bbb28953b53c01810502",
+      "patched": "b895159abd8fd5a0c3b4e288055635beea846b011028039eb5009603c2bd8055"
     },
     {
       "path": "src/msgs/handshake.rs",
       "original": "9f9d9d4686e4a3f4433edf5fcc17c224155fa3eef747363bfa53802fd67dda7d",
-      "patched": "4b5c9be7ae4c4fc000af503be9e4a8072e4bcc2de826965da1920a14bdf175bf"
+      "patched": "3ccbcd9be235604350a75433227af6991d2fd27e62071d4c6bcc65718abc440a"
+    },
+    {
+      "path": "src/server/hs.rs",
+      "original": "b1ed14e5e36ee46bfb843b86af58efda01cdaa71a7f25a2f647da21f52529f91",
+      "patched": "522555aa26cd3463199bd7d42fcdbc35d80cc4487e562d1b273ff149b4cddb1f"
+    },
+    {
+      "path": "src/server/server_conn.rs",
+      "original": "603cddb8a3a415737b7e047deedd32a2a6e4f918c2372af0bfb50ebb04de2163",
+      "patched": "5b71a5d298aabc178341e53a06a5e85a13c973d31b874e7a69be048ccdbe9f8a"
+    },
+    {
+      "path": "src/server/tls12.rs",
+      "original": "b7d083644d3be9bb6bf6cca4c654537cd22d3bc545f932ab2c9354503ebd7056",
+      "patched": "eeb72ed95b80e2b1965575308629fa858a8ce74aaf70663759334c913e690de0"
+    },
+    {
+      "path": "src/server/tls13.rs",
+      "original": "3305e69bd7fac1f08581b74799aab02f4751a262133767db3b1096c52c491a2a",
+      "patched": "72d1ca67b597a3710ee8a2e968ac4df971d3b3cf155cd119e9a5cbe6aefbedf9"
+    },
+    {
+      "path": "src/webpki/anchors.rs",
+      "original": "1caba02e098ff418429943b0ae8bc178af4994152a3d2a18327ac73392e4f4bd",
+      "patched": "4fa0d263964ac61c28fe1a0be37ee1fcad4da8133fd913a0379a61a0992985c9"
+    },
+    {
+      "path": "src/webpki/server_verifier.rs",
+      "original": "1678d02f7fa352b990915de691959e1d90309ba631b714992afd1e98600cb301",
+      "patched": "21ea8893e0551a717bb7128d277eaf05523ba682ea29aed80d4c7d536e4d6147"
     }
   ]
 }

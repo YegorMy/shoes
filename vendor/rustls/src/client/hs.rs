@@ -9,8 +9,6 @@ use pki_types::ServerName;
 #[cfg(feature = "tls12")]
 use super::tls12;
 use super::{ResolvesClientCert, Tls12Resumption};
-#[cfg(feature = "logging")]
-use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
@@ -483,7 +481,9 @@ fn emit_client_hello_for_retry(
         tls13::emit_fake_ccs(&mut input.sent_tls13_fake_ccs, cx.common);
     }
 
-    trace!("Sending ClientHello {ch:#?}");
+    // ClientHello contains SNI, session identifiers, PSK identities and key
+    // shares. Diagnostics must describe progress, never serialize handshakes.
+    trace!("Sending ClientHello");
 
     transcript_buffer.add_message(&ch);
     cx.common.send_msg(ch, false);
@@ -633,13 +633,11 @@ pub(super) fn process_alpn_protocol(
         ));
     }
 
-    debug!(
-        "ALPN protocol is {:?}",
-        common
-            .alpn_protocol
-            .as_ref()
-            .map(|v| bs_debug::BsDebug(v.as_ref()))
-    );
+    // The protocol name is encrypted-extension content: report only the outcome.
+    match common.alpn_protocol {
+        Some(_) => debug!("ALPN protocol selected"),
+        None => debug!("No ALPN protocol selected"),
+    }
     Ok(())
 }
 
@@ -680,7 +678,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
     {
         let server_hello =
             require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
-        trace!("We got ServerHello {server_hello:#?}");
+        trace!("We got ServerHello");
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
         let config = &self.input.config;
@@ -860,7 +858,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             HandshakeType::HelloRetryRequest,
             HandshakePayload::HelloRetryRequest
         )?;
-        trace!("Got HRR {hrr:?}");
+        trace!("Got HRR");
 
         cx.common.check_aligned_handshake()?;
 
@@ -1130,7 +1128,7 @@ impl ClientSessionValue {
                 }
             })
             .or_else(|| {
-                debug!("No cached session for {server_name:?}");
+                debug!("No cached session");
                 None
             });
 

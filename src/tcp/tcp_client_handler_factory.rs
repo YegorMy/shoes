@@ -135,11 +135,8 @@ pub fn create_tcp_client_handler(
             } = tls_client_config;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
-                if let Some(ref hostname) = default_sni_hostname {
-                    debug!(
-                        "Using default sni hostname for TLS client connection: {}",
-                        hostname
-                    );
+                if default_sni_hostname.is_some() {
+                    debug!("Using default sni hostname for TLS client connection");
                 }
                 default_sni_hostname
             } else {

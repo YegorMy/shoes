@@ -247,7 +247,14 @@ fn original(record: &TraceRecord) -> Result<guard::Event, &'static str> {
     })
 }
 
-fn private(record: &TraceRecord, protected: &[String]) -> Result<(), &'static str> {
+/// Classifies one original record emitted outside fixture-client scope.
+pub(super) type Classify = fn(&guard::Event, &[String]) -> Result<(), &'static str>;
+
+fn private(
+    record: &TraceRecord,
+    protected: &[String],
+    classify: Classify,
+) -> Result<(), &'static str> {
     let original = original(record)?;
     if original.fixture_client {
         return guard::fixture_record(&original);
@@ -256,57 +263,79 @@ fn private(record: &TraceRecord, protected: &[String]) -> Result<(), &'static st
     if metadata.contains(['\r', '\n']) || protected.iter().any(|s| metadata.contains(s)) {
         return Err("protected tracing metadata");
     }
-    guard::server_record(&original, protected)
+    classify(&original, protected)
 }
 
 pub(super) fn inspect(dir: &Path, protected: &[String], logs: &[guard::Event]) {
+    let violations = check(dir, protected, logs, guard::server_record);
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// Every violation in the complete tracing capture. Returning all of them lets
+/// a canary prove that an injected disclosure is detected on this channel.
+pub(super) fn check(
+    dir: &Path,
+    protected: &[String],
+    logs: &[guard::Event],
+    classify: Classify,
+) -> Vec<String> {
+    let mut violations = Vec::new();
     let bytes = std::fs::read(dir.join("tracing.jsonl")).unwrap();
-    assert!(bytes.ends_with(b"\n"), "incomplete tracing capture");
-    let records: Vec<TraceRecord> = std::str::from_utf8(&bytes)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    if !bytes.ends_with(b"\n") {
+        violations.push("incomplete tracing capture".to_owned());
+    }
+    let mut records = Vec::new();
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        match serde_json::from_str::<TraceRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(_) => violations.push(format!("malformed tracing record: {line:?}")),
+        }
+    }
     for record in &records {
-        assert!(
-            private(record, protected).is_ok(),
-            "unsafe tracing record: {record:?}"
-        );
+        if let Err(reason) = private(record, protected, classify) {
+            violations.push(format!("unsafe tracing record ({reason}): {record:?}"));
+        }
     }
     let forwarded: Vec<_> = records
         .iter()
         .filter(|record| record.target == "tls_privacy_engine_log")
-        .map(|record| original(record).unwrap())
+        .filter_map(|record| original(record).ok())
         .collect();
-    assert_eq!(
-        forwarded.len(),
-        logs.len(),
-        "every original log must reach tracing"
-    );
+    if forwarded.len() != logs.len() {
+        violations.push(format!(
+            "every original log must reach tracing ({} forwarded, {} logged)",
+            forwarded.len(),
+            logs.len()
+        ));
+    }
     for (forwarded, log) in forwarded.iter().zip(logs) {
-        assert_eq!(
-            (
-                &forwarded.level,
-                &forwarded.target,
-                &forwarded.message,
-                forwarded.fixture_client
-            ),
-            (&log.level, &log.target, &log.message, log.fixture_client)
-        );
+        if (
+            &forwarded.level,
+            &forwarded.target,
+            &forwarded.message,
+            forwarded.fixture_client,
+        ) != (&log.level, &log.target, &log.message, log.fixture_client)
+        {
+            violations.push(format!(
+                "forwarded record differs: {forwarded:?} != {log:?}"
+            ));
+        }
     }
     for (level, message) in [
         ("DEBUG", "debug collector active"),
         ("TRACE", "trace collector active"),
     ] {
-        assert!(
-            records
-                .iter()
-                .any(|record| record.target == "tls_privacy_control"
-                    && record.level == level
-                    && record.fields == [("message".into(), message.into())]),
-            "native tracing control must arrive from a spawned task"
-        );
+        if !records.iter().any(|record| {
+            record.target == "tls_privacy_control"
+                && record.level == level
+                && record.fields == [("message".into(), message.into())]
+        }) {
+            violations.push(format!(
+                "native tracing control {level} must arrive from a spawned task"
+            ));
+        }
     }
+    violations
 }
 
 #[test]
@@ -321,7 +350,7 @@ fn tracing_guard_rejects_extra_fields_spans_and_wrong_contexts() {
         related_span: None,
         fields: vec![("message".into(), "debug collector active".into())],
     };
-    assert!(private(&record, &[]).is_ok());
+    assert!(private(&record, &[], guard::server_record).is_ok());
     for value in [
         "ClientHelloPayload {\n server_name: private.invalid\n}",
         "NewSessionTicketPayloadTls13 {\n nonce: aa, ticket: bb\n}",
@@ -329,34 +358,34 @@ fn tracing_guard_rejects_extra_fields_spans_and_wrong_contexts() {
         "Starting ShadowTLSv3 TCP server at 127.0.0.1:41973",
     ] {
         record.fields.push(("extra".into(), value.into()));
-        assert!(private(&record, &[]).is_err());
+        assert!(private(&record, &[], guard::server_record).is_err());
         record.fields.pop();
         record.fields[0].1 = value.into();
-        assert!(private(&record, &[]).is_err());
+        assert!(private(&record, &[], guard::server_record).is_err());
         record.fields[0].1 = "debug collector active".into();
     }
     record
         .fields
         .push(("message".into(), "debug collector active".into()));
-    assert!(private(&record, &[]).is_err());
+    assert!(private(&record, &[], guard::server_record).is_err());
     record.fields.pop();
     record.kind = "span_fields".into();
-    assert!(private(&record, &[]).is_err());
+    assert!(private(&record, &[], guard::server_record).is_err());
     record.kind = "event".into();
     record.span = Some(1);
-    assert!(private(&record, &[]).is_err());
+    assert!(private(&record, &[], guard::server_record).is_err());
     record.span = None;
     record.target = "unexpected::dependency".into();
-    assert!(private(&record, &[]).is_err());
+    assert!(private(&record, &[], guard::server_record).is_err());
     record.fixture_client = true;
-    assert!(private(&record, &[]).is_err());
+    assert!(private(&record, &[], guard::server_record).is_err());
     record.target = "tls_privacy_engine_log".into();
     record.fields.extend([
         ("log_level".into(), "DEBUG".into()),
         ("log_target".into(), "rustls::server::hs".into()),
     ]);
     assert!(
-        private(&record, &[]).is_err(),
+        private(&record, &[], guard::server_record).is_err(),
         "server cannot become fixture output"
     );
 }
@@ -451,7 +480,7 @@ fn tracing_collector_preserves_injected_event_and_span_fields() {
     }
     for record in &records {
         assert!(
-            private(record, &[]).is_err(),
+            private(record, &[], guard::server_record).is_err(),
             "injected context admitted: {record:?}"
         );
     }

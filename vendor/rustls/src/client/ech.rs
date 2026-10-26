@@ -125,7 +125,7 @@ impl EchConfig {
             };
 
             if contents.has_unknown_mandatory_extension() || contents.has_duplicate_extension() {
-                warn!("ECH config has duplicate, or unknown mandatory extensions: {contents:?}",);
+                warn!("ECH config has duplicate, or unknown mandatory extensions");
                 continue; // Unsupported, or malformed extensions.
             }
 
@@ -143,9 +143,10 @@ impl EchConfig {
                     .iter()
                     .find(|hpke| hpke.suite() == suite)
                 {
+                    // public_name is the outer SNI; log only the selection.
                     debug!(
-                        "selected ECH config ID {:?} suite {:?} public_name {:?}",
-                        key_config.config_id, suite, contents.public_name
+                        "selected ECH config ID {:?} suite {:?}",
+                        key_config.config_id, suite
                     );
                     return Ok(Self {
                         config: config.clone(),
@@ -679,7 +680,7 @@ impl EchState {
             };
         }
 
-        trace!("ECH Inner Hello: {inner_hello:#?}");
+        trace!("ECH Inner Hello prepared");
 
         // Encode the inner hello according to the rules required for ECH. This differs
         // from the standard encoding in several ways. Notably this is where we will

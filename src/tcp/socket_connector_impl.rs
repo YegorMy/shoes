@@ -101,11 +101,8 @@ impl SocketConnectorImpl {
                 } = config.quic_settings.clone().unwrap_or_default();
 
                 let sni_hostname = if sni_hostname.is_unspecified() {
-                    if let Some(ref hostname) = default_sni_hostname {
-                        debug!(
-                            "Using default sni hostname for QUIC client connection: {}",
-                            hostname
-                        );
+                    if default_sni_hostname.is_some() {
+                        debug!("Using default sni hostname for QUIC client connection");
                     }
                     default_sni_hostname.clone()
                 } else {
@@ -274,29 +271,28 @@ impl SocketConnector for SocketConnectorImpl {
                             Ok(conn) => match conn.open_bi().await {
                                 Ok((send, recv)) => {
                                     if i > 0 {
-                                        debug!(
-                                            "QUIC connect succeeded on address #{} ({}) after {} failures",
-                                            i, target_addr, i
-                                        );
+                                        debug!("QUIC connect succeeded after {} failures", i);
                                     }
                                     return Ok(Box::new(QuicStream::from(send, recv)));
                                 }
                                 Err(e) => {
-                                    debug!("QUIC open_bi to {} failed: {}", target_addr, e);
+                                    // QUIC errors can carry the TLS server name or
+                                    // certificate details; the caller gets them.
+                                    debug!("QUIC open_bi failed, trying next");
                                     last_err = Some(std::io::Error::other(format!(
                                         "Failed to open QUIC stream: {e}"
                                     )));
                                 }
                             },
                             Err(e) => {
-                                debug!("QUIC connection to {} failed: {}", target_addr, e);
+                                debug!("QUIC connection failed, trying next");
                                 last_err = Some(std::io::Error::other(format!(
                                     "QUIC connection failed: {e}"
                                 )));
                             }
                         },
                         Err(e) => {
-                            debug!("QUIC connect to {} failed: {}", target_addr, e);
+                            debug!("QUIC connect failed, trying next");
                             last_err = Some(std::io::Error::other(format!(
                                 "Failed to connect to QUIC endpoint: {e}"
                             )));

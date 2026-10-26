@@ -398,10 +398,7 @@ impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
         )?
         .into_inner();
 
-        trace!(
-            "Server stapled OCSP response is {:?}",
-            server_cert_ocsp_response
-        );
+        trace!("Server stapled OCSP response received");
 
         let server_cert = ServerCertDetails::new(self.server_cert_chain, server_cert_ocsp_response);
 
@@ -484,8 +481,8 @@ impl State<ClientConnectionData> for ExpectServerKx<'_> {
                 ServerKeyExchangeParams::Ecdh(ecdhe) => {
                     debug!("ECDHE curve is {:?}", ecdhe.curve_params)
                 }
-                ServerKeyExchangeParams::Dh(dhe) => {
-                    debug!("DHE params are p = {:?}, g = {:?}", dhe.dh_p, dhe.dh_g)
+                ServerKeyExchangeParams::Dh(_) => {
+                    debug!("DHE params received")
                 }
             }
         }
@@ -748,7 +745,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest<'_> {
             HandshakePayload::CertificateRequest
         )?;
         self.transcript.add_message(&m);
-        debug!("Got CertificateRequest {certreq:?}");
+        debug!("Got CertificateRequest");
 
         // The RFC jovially describes the design here as 'somewhat complicated'
         // and 'somewhat underspecified'.  So thanks for that.
@@ -853,8 +850,11 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
 
         cx.common.check_aligned_handshake()?;
 
-        trace!("Server cert is {:?}", st.server_cert.cert_chain);
-        debug!("Server DNS name is {:?}", st.server_name);
+        trace!(
+            "Server certificate chain received (count: {})",
+            st.server_cert.cert_chain.len()
+        );
+        debug!("Verifying server certificate for configured server name");
 
         let suite = st.suite;
 

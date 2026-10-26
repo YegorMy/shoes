@@ -452,7 +452,8 @@ mod verifybench;
 mod x509;
 #[macro_use]
 mod check;
-#[cfg(feature = "logging")]
+// Only client ALPN diagnostics rendered protocol names; they no longer do.
+#[cfg(test)]
 mod bs_debug;
 mod builder;
 mod enums;
