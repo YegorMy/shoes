@@ -497,7 +497,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
             HandshakeType::EncryptedExtensions,
             HandshakePayload::EncryptedExtensions
         )?;
-        debug!("TLS1.3 encrypted extensions: {exts:?}");
+        debug!("TLS1.3 encrypted extensions received");
         self.transcript.add_message(&m);
 
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
@@ -875,7 +875,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
             HandshakePayload::CertificateRequestTls13
         )?;
         self.transcript.add_message(&m);
-        debug!("Got CertificateRequest {certreq:?}");
+        debug!("Got CertificateRequest");
 
         // Fortunately the problems here in TLS1.2 and prior are corrected in
         // TLS1.3.
@@ -1157,7 +1157,10 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
             HandshakePayload::CertificateVerify
         )?;
 
-        trace!("Server cert is {:?}", self.server_cert.cert_chain);
+        trace!(
+            "Server certificate chain received (count: {})",
+            self.server_cert.cert_chain.len()
+        );
 
         // 1. Verify the certificate chain.
         let (end_entity, intermediates) = self

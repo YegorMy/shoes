@@ -67,10 +67,9 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        debug!(
-            "[ProxyConnector] setup_tcp_stream: {} -> {}",
-            self.location, target
-        );
+        // The proxy endpoint can be a server name and the target is tunnelled
+        // traffic; neither belongs in diagnostics.
+        debug!("[ProxyConnector] setup_tcp_stream");
         self.client_handler
             .setup_client_tcp_stream(stream, target.clone())
             .await
@@ -81,10 +80,7 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        debug!(
-            "[ProxyConnector] setup_udp_bidirectional: {} -> {}",
-            self.location, target
-        );
+        debug!("[ProxyConnector] setup_udp_bidirectional");
         self.client_handler
             .setup_client_udp_bidirectional(stream, target)
             .await

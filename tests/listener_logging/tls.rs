@@ -1,6 +1,8 @@
 //! Real TLS flights with a global, unfiltered Shoes logger. Fixture-client work
 //! is explicitly task-scoped; everything else (including unknown targets) is
 //! treated as server output. Raw records and both process channels are retained.
+#[path = "tls_client.rs"]
+mod client;
 #[path = "tls_guard.rs"]
 mod guard;
 #[path = "tls_trace.rs"]
@@ -749,6 +751,7 @@ fn server_diagnostics_are_private() {
         .unwrap();
         return;
     }
+    let _ports = super::PORTS.blocking_lock();
     let root = std::env::var_os("SHOES_TLS_PRIVACY_CAPTURE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("target"));

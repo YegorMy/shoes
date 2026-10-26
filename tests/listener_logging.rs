@@ -35,6 +35,10 @@ const QUERY: &str = "query.listener-privacy.invalid";
 const ERROR_IPV6: &str = "[2001:db8::cafe]:43197";
 const CONTROL: &str = "listener privacy collector control";
 
+// Suites that reserve a port, release it and bind it again must not overlap
+// with suites that open many connections, which can take a released port.
+static PORTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Default)]
 struct Capture(Mutex<Vec<String>>);
 
@@ -219,6 +223,7 @@ fn listener_config(binding: &str) -> Config {
 
 #[tokio::test]
 async fn listener_logs_omit_sensitive_values() {
+    let _ports = PORTS.lock().await;
     let capture = Box::leak(Box::new(Capture::default()));
     log::set_logger(capture).expect("dedicated test binary must own its logger");
     log::set_max_level(LevelFilter::Trace);

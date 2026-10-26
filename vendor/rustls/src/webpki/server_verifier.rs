@@ -270,7 +270,7 @@ impl ServerCertVerifier for WebPkiServerVerifier {
         )?;
 
         if !ocsp_response.is_empty() {
-            trace!("Unvalidated OCSP response: {:?}", ocsp_response.to_vec());
+            trace!("Unvalidated OCSP response present");
         }
 
         verify_server_name(&cert, server_name)?;
