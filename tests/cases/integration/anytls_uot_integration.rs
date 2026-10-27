@@ -14,6 +14,10 @@ use common::socks5::{Socks5UdpAssociation, SocksDestination};
 use common::test_fixture::{start_shoes_server, start_singbox_server};
 use common::test_servers::{TestServer, start_udp_echo_server};
 
+#[cfg(feature = "optional-peer-tests")]
+#[path = "anytls_singbox_uot_peer.rs"]
+mod singbox_peer;
+
 const PASSWORD: &str = "testpassword123";
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

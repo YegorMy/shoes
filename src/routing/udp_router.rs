@@ -304,6 +304,15 @@ impl ServerStream {
         }
     }
 
+    /// Whether an empty message just read is end of stream rather than an
+    /// empty datagram. XUDP keeps the zero-length EOF convention.
+    fn is_message_eof(&self) -> bool {
+        match self {
+            ServerStream::Targeted(stream) => stream.is_message_eof(),
+            ServerStream::Session(_) => true,
+        }
+    }
+
     fn supports_ping(&self) -> bool {
         match self {
             ServerStream::Targeted(stream) => stream.supports_ping(),
@@ -577,7 +586,7 @@ impl<'a> UdpRouter<'a> {
             };
 
             let len = read_buf.filled().len();
-            if len == 0 {
+            if len == 0 && self.server.is_message_eof() {
                 self.set_server_read_eof();
                 break;
             }
@@ -602,6 +611,12 @@ impl<'a> UdpRouter<'a> {
 
                     // Skip if session has too many pending writes (backpressure)
                     if session.in_remote_write_queue >= MAX_PENDING_REMOTE_WRITES_PER_SESSION {
+                        continue;
+                    }
+
+                    // A remote that reads empty messages as EOF cannot carry an
+                    // empty datagram: drop only that datagram.
+                    if len == 0 && session.remote.is_message_eof() {
                         continue;
                     }
 
@@ -796,7 +811,11 @@ impl<'a> UdpRouter<'a> {
                             "[UdpRouter] Read {} bytes from session remote (session {})",
                             len, session.destination
                         );
-                        if len == 0 {
+                        // An empty datagram is forwarded only when both ends carry
+                        // empty messages; otherwise it keeps meaning end of stream.
+                        if len == 0
+                            && (session.remote.is_message_eof() || self.server.is_message_eof())
+                        {
                             session.remote_read_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(id);
@@ -986,8 +1005,9 @@ impl<'a> UdpRouter<'a> {
                     .insert(id, Duration::from_secs(SESSION_TIMEOUT_SECS));
                 session.expiry_key = Some(expiry_key);
 
-                // Try to write immediately
-                if !initial_data.is_empty() {
+                // Try to write immediately. An empty first datagram is written
+                // only to a remote that can carry one.
+                if !initial_data.is_empty() || !session.remote.is_message_eof() {
                     debug!(
                         "Writing initial_data ({} bytes) to session for {}",
                         initial_data.len(),
@@ -1659,5 +1679,217 @@ mod tests {
         assert_eq!(state.shutdown_polls.load(Ordering::SeqCst), 0);
         assert_eq!(state.drops.load(Ordering::SeqCst), 1);
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Duplex half usable as the transport under a packet-address stream.
+    struct Duplex(tokio::io::DuplexStream);
+
+    impl AsyncRead for Duplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Duplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for Duplex {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for Duplex {}
+
+    fn direct_selector() -> Arc<ClientProxySelector> {
+        use crate::client_proxy_chain::ClientChainGroup;
+        use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+        use crate::config::{ClientChainHop, ClientConfig, ConfigSelection};
+        let config: ClientConfig = serde_yaml::from_str("protocol:\n  type: direct\n").unwrap();
+        let chain = crate::tcp::chain_builder::build_client_proxy_chain(
+            crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                config,
+            ))),
+            Arc::new(NativeResolver::new()),
+        );
+        Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::ANY],
+            ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+        )]))
+    }
+
+    /// A UoT non-connect record: `[family 0x00][IPv4][port][u16 length][payload]`.
+    fn uot_record(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let SocketAddr::V4(target) = target else {
+            unreachable!()
+        };
+        let mut bytes = vec![0x00];
+        bytes.extend(target.ip().octets());
+        bytes.extend(target.port().to_be_bytes());
+        bytes.extend(u16::try_from(payload.len()).unwrap().to_be_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn empty_packet_address_datagram_is_relayed_both_ways() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut buf = vec![0; 65535];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                counted.lock().unwrap().push(n);
+                echo.send_to(&buf[..n], peer).await.unwrap();
+            }
+        });
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let server = ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(
+            Duplex(server),
+        )));
+        let routing = tokio::spawn(run_udp_routing(
+            server,
+            direct_selector(),
+            Arc::new(NativeResolver::new()),
+            false,
+        ));
+        let payloads: [&[u8]; 3] = [b"before-empty", b"", b"after-empty"];
+        let mut replies = Vec::new();
+        for payload in payloads {
+            client
+                .write_all(&uot_record(target, payload))
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut header = [0; 9];
+                client.read_exact(&mut header).await.unwrap();
+                let mut data = vec![0; usize::from(u16::from_be_bytes([header[7], header[8]]))];
+                client.read_exact(&mut data).await.unwrap();
+                data
+            })
+            .await;
+            match reply {
+                Ok(data) => replies.push(data),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![12, 0, 11],
+            "destination datagrams"
+        );
+        assert_eq!(replies, payloads.map(<[u8]>::to_vec), "client replies");
+        routing.abort();
+    }
+
+    /// A targeted stream that keeps the legacy convention: empty means EOF.
+    /// Its first message is empty; any later read would yield a datagram.
+    struct EmptyThenData {
+        reads: Arc<AtomicUsize>,
+        target: SocketAddr,
+    }
+
+    impl AsyncReadTargetedMessage for EmptyThenData {
+        fn poll_read_targeted_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<NetLocation>> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                buf.put_slice(b"after-empty");
+            }
+            Poll::Ready(Ok(NetLocation::from_ip_addr(
+                self.target.ip(),
+                self.target.port(),
+            )))
+        }
+    }
+
+    impl AsyncWriteSourcedMessage for EmptyThenData {
+        fn poll_write_sourced_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+            _source: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for EmptyThenData {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for EmptyThenData {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for EmptyThenData {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncTargetedMessageStream for EmptyThenData {}
+
+    #[tokio::test]
+    async fn empty_message_still_ends_reads_with_the_legacy_convention() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server = ServerStream::Targeted(Box::new(EmptyThenData {
+            reads: Arc::clone(&reads),
+            target: target.local_addr().unwrap(),
+        }));
+        let routing = tokio::spawn(run_udp_routing(
+            server,
+            direct_selector(),
+            Arc::new(NativeResolver::new()),
+            false,
+        ));
+        let mut buf = [0; 64];
+        let received =
+            tokio::time::timeout(Duration::from_millis(500), target.recv_from(&mut buf)).await;
+        assert!(
+            received.is_err(),
+            "nothing is read after the end-of-stream message"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        routing.abort();
     }
 }

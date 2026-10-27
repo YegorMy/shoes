@@ -312,7 +312,12 @@ impl<S: AsyncStream> AsyncPing for PacketAddrStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {}
+impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {
+    /// A zero-length record is an empty datagram; only transport EOF ends.
+    fn is_message_eof(&self) -> bool {
+        self.is_eof
+    }
+}
 
 pub type UotV1ServerStream<S> = PacketAddrStream<S>;
 pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;

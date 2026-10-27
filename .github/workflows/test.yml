@@ -187,3 +187,9 @@ jobs:
         cargo test -p shoes --locked --features optional-peer-tests
         --test integration --verbose shadowtls_cert_verification::
         -- --nocapture --test-threads=1
+
+    - name: Verify empty UoT datagrams from the pinned sing-box client
+      run: >-
+        cargo test -p shoes --locked --features optional-peer-tests
+        --test integration --verbose anytls_uot::singbox_peer::
+        -- --nocapture --test-threads=1

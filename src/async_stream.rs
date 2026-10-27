@@ -163,6 +163,12 @@ pub trait AsyncTargetedMessageStream:
     + Unpin
     + Send
 {
+    /// Consult after a successful read whose message payload is empty.
+    /// The default preserves legacy streams' zero-length EOF convention.
+    /// Streams carrying empty datagrams override this with their actual EOF state.
+    fn is_message_eof(&self) -> bool {
+        true
+    }
 }
 
 /// Client stream trait connected directly to targets or to proxy servers, where received messages
