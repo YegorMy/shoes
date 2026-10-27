@@ -420,7 +420,11 @@ impl AnyTlsSession {
                 // Send FIN frame
                 let frame = Frame::control(Command::Fin, stream_id);
                 if let Err(e) = self.write_frame(&frame).await {
-                    log::debug!("Failed to send FIN for stream {}: {}", stream_id, e);
+                    log::debug!(
+                        "Failed to send FIN for stream {} (kind={:?})",
+                        stream_id,
+                        e.kind()
+                    );
                 }
 
                 // Remove stream from map
@@ -430,7 +434,11 @@ impl AnyTlsSession {
                 // Send data frame
                 let frame = Frame::data(stream_id, data);
                 if let Err(e) = self.write_frame(&frame).await {
-                    log::debug!("Failed to send data for stream {}: {}", stream_id, e);
+                    log::debug!(
+                        "Failed to send data for stream {} (kind={:?})",
+                        stream_id,
+                        e.kind()
+                    );
                     break;
                 }
             }
@@ -455,7 +463,7 @@ impl AnyTlsSession {
             // Decode and process any frames already in buffer (from initial data)
             while let Some(frame) = FrameCodec::decode(&mut buffer)? {
                 if let Err(e) = self.handle_frame(frame).await {
-                    log::warn!("Error handling frame: {}", e);
+                    log::warn!("Error handling frame (kind={:?})", e.kind());
                     return Err(e);
                 }
             }
@@ -617,7 +625,11 @@ impl AnyTlsSession {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
                             Ok(Err(e)) => {
-                                log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
+                                log::debug!(
+                                    "AnyTLS stream {} error (kind={:?})",
+                                    stream_id_for_cleanup,
+                                    e.kind()
+                                );
                             }
                             Err(_) => {
                                 log::warn!(
@@ -647,11 +659,11 @@ impl AnyTlsSession {
 
                 // Handle SYNACK - for now just log
                 if !frame.data.is_empty() {
-                    let error_msg = String::from_utf8_lossy(&frame.data);
+                    // Peer-supplied text is not logged: its length only.
                     log::warn!(
-                        "Stream {} error from server: {}",
+                        "Stream {} error from server ({} bytes)",
                         frame.stream_id,
-                        error_msg
+                        frame.data.len()
                     );
                 } else {
                     log::debug!("Stream {} acknowledged", frame.stream_id);
@@ -773,7 +785,7 @@ impl AnyTlsSession {
             Command::Alert => {
                 // Alert - fatal error
                 let msg = String::from_utf8_lossy(&frame.data);
-                log::error!("Received alert: {}", msg);
+                log::error!("Received alert ({} bytes)", frame.data.len());
                 return Err(io::Error::other(msg.to_string()));
             }
 
@@ -959,12 +971,8 @@ impl AnyTlsSession {
         // Read destination address (SOCKS5 address format)
         let destination = read_location_direct(&mut stream).await?;
 
-        log::debug!(
-            "AnyTLS stream {} (user: {}) -> {}",
-            stream_id,
-            self.user_name,
-            destination
-        );
+        // Destinations are private: stream ids, users and outcomes only.
+        log::debug!("AnyTLS stream {} (user: {})", stream_id, self.user_name);
 
         // Check for UoT magic addresses
         if let Address::Hostname(host) = destination.address() {
@@ -997,11 +1005,7 @@ impl AnyTlsSession {
                 chain_group,
                 remote_location,
             } => {
-                log::debug!(
-                    "AnyTLS stream {} routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
+                log::debug!("AnyTLS stream {} routing through chain", stream_id);
 
                 // Connect through the proxy chain
                 let client_result = match chain_group
@@ -1027,7 +1031,11 @@ impl AnyTlsSession {
 
                 // Send successful SYNACK (protocol v2)
                 if let Err(e) = self.send_synack(stream_id, None).await {
-                    log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
+                    log::debug!(
+                        "Failed to send SYNACK for stream {} (kind={:?})",
+                        stream_id,
+                        e.kind()
+                    );
                     // Continue anyway - client may be v1
                 }
 
@@ -1041,7 +1049,7 @@ impl AnyTlsSession {
                 let _ = client_stream.shutdown().await;
 
                 if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} ended: {}", stream_id, e);
+                    log::debug!("AnyTLS stream {} ended (kind={:?})", stream_id, e.kind());
                 } else {
                     log::debug!("AnyTLS stream {} completed", stream_id);
                 }
@@ -1082,11 +1090,10 @@ impl AnyTlsSession {
         let destination = read_location_direct(&mut stream).await?;
 
         log::debug!(
-            "AnyTLS stream {} UoT V2 (user: {}, connect={}) -> {}",
+            "AnyTLS stream {} UoT V2 (user: {}, connect={})",
             stream_id,
             self.user_name,
-            is_connect,
-            destination
+            is_connect
         );
 
         if is_connect == 1 {
@@ -1143,9 +1150,8 @@ impl AnyTlsSession {
                 remote_location,
             } => {
                 log::debug!(
-                    "AnyTLS stream {} UoT V2 connect: routing {} through chain",
-                    stream_id,
-                    remote_location
+                    "AnyTLS stream {} UoT V2 connect: routing through chain",
+                    stream_id
                 );
 
                 // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
@@ -1175,7 +1181,11 @@ impl AnyTlsSession {
                 let result = run_udp_copy(server_stream, client_stream, false, false).await;
 
                 if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
+                    log::debug!(
+                        "AnyTLS stream {} UoT V2 connect ended (kind={:?})",
+                        stream_id,
+                        e.kind()
+                    );
                 } else {
                     log::debug!("AnyTLS stream {} UoT V2 connect completed", stream_id);
                 }
@@ -1189,9 +1199,8 @@ impl AnyTlsSession {
                     .await;
 
                 log::warn!(
-                    "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
-                    stream_id,
-                    destination
+                    "AnyTLS stream {} UoT V2 connect blocked by rules",
+                    stream_id
                 );
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
@@ -1229,7 +1238,11 @@ impl AnyTlsSession {
         .await;
 
         if let Err(e) = &result {
-            log::debug!("AnyTLS stream {} UoT multi-dest ended: {}", stream_id, e);
+            log::debug!(
+                "AnyTLS stream {} UoT multi-dest ended (kind={:?})",
+                stream_id,
+                e.kind()
+            );
         } else {
             log::debug!("AnyTLS stream {} UoT multi-dest completed", stream_id);
         }

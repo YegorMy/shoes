@@ -335,20 +335,19 @@ impl TcpServerHandler for VmessTcpServerHandler {
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader.read_slice_into(&mut margin_bytes)?;
-            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
+
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
+        // Header bytes and their checksums never enter diagnostics.
         log::info!(
-            "VMess FNV1a: expected={}, actual={}",
-            expected_check_value,
-            actual_check_value
+            "VMess FNV1a header check: {}",
+            expected_check_value == actual_check_value
         );
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
@@ -571,7 +570,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                         )
                         .await
                         {
-                            log::debug!("VMess h2mux session ended: {}", e);
+                            log::debug!("VMess h2mux session ended (kind={:?})", e.kind());
                         }
                     });
 

@@ -198,7 +198,8 @@ async fn http1_fallback_service(
         Method::GET | Method::HEAD => {
             let path = req.uri().path();
             let is_head = req.method() == Method::HEAD;
-            debug!("NaiveProxy HTTP/1.1: serving fallback for {}", path);
+            // Request paths and destinations are private.
+            debug!("NaiveProxy HTTP/1.1: serving fallback");
             serve_fallback(path, &fallback_path, is_head).await
         }
         Method::OPTIONS => Ok(Response::builder()
@@ -222,10 +223,7 @@ async fn naive_service(
         Method::CONNECT => {}
         Method::GET | Method::HEAD => {
             let is_head = req.method() == Method::HEAD;
-            debug!(
-                "NaiveProxy HTTP/2: serving fallback for {}",
-                req.uri().path()
-            );
+            debug!("NaiveProxy HTTP/2: serving fallback");
             return serve_fallback(req.uri().path(), &config.fallback_path, is_head).await;
         }
         Method::OPTIONS => {
@@ -284,7 +282,7 @@ async fn naive_service(
         }
     };
 
-    debug!("[{}] NaiveProxy CONNECT to {}", username, destination);
+    debug!("[{}] NaiveProxy CONNECT", username);
 
     let padding_type = if config.padding_enabled && has_padding {
         if let Some(types) = req.headers().get("padding-type-request") {
@@ -324,7 +322,7 @@ async fn naive_service(
                     )
                     .await
                     {
-                        debug!("NaiveProxy tunnel error: {}", e);
+                        debug!("NaiveProxy tunnel error (kind={:?})", e.kind());
                     }
                 } else if let Err(e) = handle_naive_stream(
                     io,
@@ -336,7 +334,7 @@ async fn naive_service(
                 )
                 .await
                 {
-                    debug!("NaiveProxy tunnel error: {}", e);
+                    debug!("NaiveProxy tunnel error (kind={:?})", e.kind());
                 }
             }
             Err(e) => {
@@ -471,8 +469,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             let destination = read_location_direct(&mut stream).await?;
 
             debug!(
-                "NaiveProxy stream (user: {}): UoT V2 connect={} -> {}",
-                user_name, is_connect, destination
+                "NaiveProxy stream (user: {}): UoT V2 connect={}",
+                user_name, is_connect
             );
 
             if is_connect == 1 {
@@ -521,10 +519,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         }
     }
 
-    debug!(
-        "NaiveProxy stream (user: {}): TCP -> {}",
-        user_name, remote_location
-    );
+    debug!("NaiveProxy stream (user: {}): TCP", user_name);
 
     let action = proxy_selector
         .judge(remote_location.clone().into(), &resolver)
@@ -565,7 +560,11 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             Ok(())
         }
         Err(e) => {
-            debug!("NaiveProxy stream (user: {}): error: {}", user_name, e);
+            debug!(
+                "NaiveProxy stream (user: {}): error (kind={:?})",
+                user_name,
+                e.kind()
+            );
             Err(e)
         }
     }

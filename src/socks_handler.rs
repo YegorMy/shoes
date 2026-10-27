@@ -315,7 +315,8 @@ pub async fn setup_socks_server_stream_inner(
             log::debug!("SOCKS UoT V2: is_connect = {}", is_connect);
 
             let destination = read_location(&mut server_stream, &mut stream_reader).await?;
-            log::debug!("SOCKS UoT V2: destination = {:?}", destination);
+            // Destinations and client hints are private.
+            log::debug!("SOCKS UoT V2: destination parsed");
 
             if is_connect == 1 {
                 // V2 Connect mode: Single destination, length-prefixed packets only
@@ -375,7 +376,7 @@ async fn handle_udp_associate(
 ) -> std::io::Result<TcpServerSetupResult> {
     // Read client's hint address (DST.ADDR:DST.PORT) - we ignore this per RFC
     let _client_hint = read_location(&mut server_stream, stream_reader).await?;
-    log::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", _client_hint);
+    log::debug!("SOCKS5 UDP ASSOCIATE: client hint received");
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -413,7 +414,7 @@ async fn handle_udp_associate(
         if let Err(e) =
             run_udp_associate(server_stream, relay_stream, proxy_selector, resolver).await
         {
-            log::debug!("SOCKS5 UDP ASSOCIATE ended: {}", e);
+            log::debug!("SOCKS5 UDP ASSOCIATE ended (kind={:?})", e.kind());
         }
     });
 

@@ -28,13 +28,9 @@ impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match this.socket.poll_recv_from(cx, buf) {
-            Poll::Ready(Ok(addr)) => {
-                log::debug!(
-                    "[UnconnectedUdp] Received {} bytes from {} (target: {})",
-                    buf.filled().len(),
-                    addr,
-                    this.destination
-                );
+            // The source is the destination's resolved address: size only.
+            Poll::Ready(Ok(_)) => {
+                log::debug!("[UnconnectedUdp] Received {} bytes", buf.filled().len());
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

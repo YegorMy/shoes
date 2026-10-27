@@ -240,7 +240,7 @@ impl AnyTlsServerHandler {
                 None => session.run().await,
             };
             if let Err(e) = result {
-                log::debug!("AnyTLS session ended: {}", e);
+                log::debug!("AnyTLS session ended (kind={:?})", e.kind());
             }
         });
 
@@ -257,7 +257,8 @@ impl AnyTlsServerHandler {
         reader: StreamReader,
         fallback: &NetLocation,
     ) -> std::io::Result<TcpServerSetupResult> {
-        log::debug!("AnyTLS FALLBACK: Connecting to fallback: {}", fallback);
+        // Fallback destinations and their resolved addresses are private.
+        log::debug!("AnyTLS FALLBACK: Connecting to fallback");
 
         // Get the unconsumed data from the reader (includes auth header)
         let unconsumed_data = reader.unparsed_data();
@@ -265,7 +266,7 @@ impl AnyTlsServerHandler {
         // Resolve and connect to the fallback destination
         let dest_addr = crate::resolver::resolve_single_address(&self.resolver, fallback).await?;
 
-        log::debug!("AnyTLS FALLBACK: Resolved {} to {}", fallback, dest_addr);
+        log::debug!("AnyTLS FALLBACK: Resolved fallback");
 
         let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
 
@@ -298,7 +299,7 @@ impl AnyTlsServerHandler {
             let _ = dest_stream.shutdown().await;
 
             if let Err(e) = result {
-                log::debug!("AnyTLS FALLBACK: Connection ended: {}", e);
+                log::debug!("AnyTLS FALLBACK: Connection ended (kind={:?})", e.kind());
             } else {
                 log::debug!("AnyTLS FALLBACK: Connection completed");
             }

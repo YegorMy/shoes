@@ -272,7 +272,8 @@ impl H2MuxClientSession {
 
         self.active_streams.fetch_add(1, Ordering::Relaxed);
 
-        debug!("H2MuxClientSession: opened stream to {}", destination);
+        // Destinations are private.
+        debug!("H2MuxClientSession: opened stream");
 
         Ok(Box::new(client_stream))
     }

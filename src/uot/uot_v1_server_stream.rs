@@ -157,20 +157,17 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
                     let total_consumed = payload_start + payload_len;
                     this.read_buf.consume(total_consumed);
 
+                    // Destinations and payload bytes are private: lengths only.
                     log::trace!(
-                        "PacketAddrStream: parsed packet to {}, payload_len={}",
-                        location,
+                        "PacketAddrStream: parsed packet, payload_len={}",
                         payload_len
                     );
                     return Poll::Ready(Ok(location));
                 }
                 None => {
-                    let data = this.read_buf.as_slice();
-                    let preview: Vec<u8> = data.iter().take(20).copied().collect();
                     log::trace!(
-                        "PacketAddrStream: incomplete packet, buf_len={}, first_bytes={:02x?}",
-                        this.read_buf.len(),
-                        preview
+                        "PacketAddrStream: incomplete packet, buf_len={}",
+                        this.read_buf.len()
                     );
                     // Need more data - continue below
                 }
@@ -201,7 +198,7 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
                     // Loop to try parsing again
                 }
                 Poll::Ready(Err(e)) => {
-                    log::trace!("PacketAddrStream: read error: {}", e);
+                    log::trace!("PacketAddrStream: read error (kind={:?})", e.kind());
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => {

@@ -482,7 +482,8 @@ fn run_direct_stack_thread(
                     IpProtocol::Tcp => {
                         match extract_tcp_info(&pkt) {
                             Some((src_addr, dst_addr, is_syn)) => {
-                                trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
+                                // Destinations are private: the app-side source, flags and outcomes only.
+                                trace!("TCP packet from {}, SYN={}", src_addr, is_syn);
                                 if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
                                     // Check connection limit
                                     if sockets.len() >= MAX_CONCURRENT_CONNECTIONS {
@@ -493,7 +494,7 @@ fn run_direct_stack_thread(
                                         continue;
                                     }
 
-                                    info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
+                                    info!("New TCP SYN from {}", src_addr);
 
                                     if let Some((new_conn, control)) = create_tcp_connection(
                                         src_addr,
@@ -681,10 +682,7 @@ fn run_direct_stack_thread(
         for handle in sockets_to_remove {
             if let Some(socket_info) = sockets.remove(&handle) {
                 active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
-                trace!(
-                    "Cleaned up connection: {} -> {}",
-                    socket_info.src_addr, socket_info.dst_addr
-                );
+                trace!("Cleaned up connection from {}", socket_info.src_addr);
             }
             socket_set.remove(handle);
         }
@@ -766,11 +764,11 @@ fn create_tcp_connection(
     socket.set_ack_delay(None);
 
     if let Err(e) = socket.listen(dst_addr) {
-        warn!("Failed to listen on socket for {}: {:?}", dst_addr, e);
+        warn!("Failed to listen on socket: {:?}", e);
         return None;
     }
 
-    debug!("Creating TCP connection: {} -> {}", src_addr, dst_addr);
+    debug!("Creating TCP connection from {}", src_addr);
 
     let control = Arc::new(TcpConnectionControl::new(
         TCP_SEND_BUFFER_SIZE,

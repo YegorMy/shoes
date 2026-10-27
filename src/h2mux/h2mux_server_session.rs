@@ -168,7 +168,7 @@ impl H2MuxServerSession {
                             let inbound_tx = inbound_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
-                                    debug!("H2MuxServerSession: stream error: {}", e);
+                                    debug!("H2MuxServerSession: stream error (kind={:?})", e.kind());
                                 }
                             });
                         }
@@ -201,7 +201,7 @@ impl H2MuxServerSession {
                                         let inbound_tx = inbound_tx.clone();
                                         tokio::spawn(async move {
                                             if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
-                                                debug!("H2MuxServerSession: stream error during drain: {}", e);
+                                                debug!("H2MuxServerSession: stream error during drain (kind={:?})", e.kind());
                                             }
                                         });
                                     }
@@ -250,9 +250,10 @@ impl H2MuxServerSession {
         // Read stream request (destination)
         let stream_request = StreamRequest::decode_async(&mut stream).await?;
 
+        // Destinations are private: networks, modes and outcomes only.
         debug!(
-            "H2MuxServerSession: new stream to {} ({})",
-            stream_request.destination, stream_request.network
+            "H2MuxServerSession: new stream ({})",
+            stream_request.network
         );
 
         // Wrap with server stream that sends status on first write
@@ -316,7 +317,7 @@ where
         let fut = handler(inbound);
         tokio::spawn(async move {
             if let Err(e) = fut.await {
-                debug!("H2MUX stream handler error: {}", e);
+                debug!("H2MUX stream handler error (kind={:?})", e.kind());
             }
         });
     }
@@ -361,7 +362,7 @@ where
             if let Err(e) =
                 handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
             {
-                debug!("H2MUX stream error: {}", e);
+                debug!("H2MUX stream error (kind={:?})", e.kind());
             }
         });
         while streams.try_join_next().is_some() {}
@@ -388,9 +389,8 @@ async fn handle_h2mux_stream(
     let destination = request.destination;
 
     info!(
-        "H2MUX stream: {} -> {} (udp={}, packet_addr={})",
+        "H2MUX stream: {} (udp={}, packet_addr={})",
         if is_udp { "UDP" } else { "TCP" },
-        destination,
         is_udp,
         packet_addr
     );
@@ -435,7 +435,7 @@ async fn handle_h2mux_tcp(
             chain_group,
             remote_location,
         } => {
-            debug!("H2MUX TCP: connecting to {} via chain", remote_location);
+            debug!("H2MUX TCP: connecting via chain");
 
             let client_result = chain_group.connect_tcp(remote_location, &resolver).await?;
             let mut client_stream = client_result.client_stream;
@@ -449,7 +449,7 @@ async fn handle_h2mux_tcp(
             result
         }
         ConnectDecision::Block => {
-            debug!("H2MUX TCP: blocked by rules: {}", destination);
+            debug!("H2MUX TCP: blocked by rules");
             let _ = stream
                 .write_error_response("Connection blocked by rules")
                 .await;
@@ -469,7 +469,7 @@ async fn handle_h2mux_udp(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
-    debug!("H2MUX UDP fixed: {}", destination);
+    debug!("H2MUX UDP fixed");
 
     let action = proxy_selector.judge(destination.into(), &resolver).await?;
 
@@ -521,7 +521,10 @@ async fn handle_h2mux_udp_packet_addr(
     )
     .await;
 
-    debug!("H2MUX UDP packet_addr mode - routing ended: {:?}", result);
+    debug!(
+        "H2MUX UDP packet_addr mode - routing ended (error kind={:?})",
+        result.as_ref().err().map(std::io::Error::kind)
+    );
     result
 }
 

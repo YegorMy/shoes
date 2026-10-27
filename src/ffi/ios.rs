@@ -169,7 +169,8 @@ pub unsafe extern "C" fn shoes_start(
     runtime.spawn(async move {
         match common::start_from_config(&config_str, shutdown_rx).await {
             Ok(()) => info!("shoes service stopped normally"),
-            Err(e) => error!("shoes service error: {}", e),
+            // Service errors can carry configuration values or destinations.
+            Err(e) => error!("shoes service error (kind={:?})", e.kind()),
         }
         running_clone.store(false, Ordering::SeqCst);
     });

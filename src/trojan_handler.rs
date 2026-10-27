@@ -182,7 +182,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                 )
                 .await
                 {
-                    debug!("Trojan h2mux session ended: {}", e);
+                    debug!("Trojan h2mux session ended (kind={:?})", e.kind());
                 }
             });
 

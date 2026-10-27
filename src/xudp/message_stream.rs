@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
     AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage, MessageSessionId,
@@ -143,9 +143,10 @@ impl XudpMessageStream {
             return Ok(Some(*route_id));
         }
         if self.routes.len() >= MAX_XUDP_ROUTES {
+            // Destinations and resolved addresses are private: session ids, sizes
+            // and outcomes only.
             log::warn!(
-                "[XUDP SESSION READ] Dropping packet for new destination {} after reaching the {}-route limit",
-                original_destination,
+                "[XUDP SESSION READ] Dropping packet for a new destination after reaching the {}-route limit",
                 MAX_XUDP_ROUTES
             );
             return Ok(None);
@@ -241,11 +242,11 @@ impl XudpMessageStream {
                 .expect("metadata decode should succeed after length check");
 
             log::debug!(
-                "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
+                "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, has_target={}, network={:?}",
                 metadata.session_id,
                 metadata.status,
                 metadata.option.has_data(),
-                metadata.target,
+                metadata.target.is_some(),
                 metadata.network
             );
 
@@ -313,9 +314,8 @@ impl XudpMessageStream {
             }
 
             log::debug!(
-                "[XUDP READ] Decoded complete frame with {} bytes for destination {}",
-                data.len(),
-                destination
+                "[XUDP READ] Decoded complete frame with {} bytes",
+                data.len()
             );
             return Ok(Some((data, destination, metadata.session_id)));
         }
@@ -414,7 +414,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                     };
 
                     // Resolve hostname to IP if needed
-                    log::debug!("[XUDP SESSION READ] Resolving destination: {}", destination);
+                    log::debug!("[XUDP SESSION READ] Resolving destination");
                     let socket_addr =
                         match this.resolver_cache.poll_resolve_location(cx, &destination) {
                             Poll::Ready(Ok(addr)) => addr,
@@ -428,25 +428,9 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                             }
                         };
 
-                    let resolved_destination = match socket_addr {
-                        SocketAddr::V4(addr) => {
-                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                        }
-                        SocketAddr::V6(addr) => {
-                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                        }
-                    };
-                    log::debug!(
-                        "[XUDP SESSION READ] Resolved {} -> {}",
-                        destination,
-                        resolved_destination
-                    );
+                    log::debug!("[XUDP SESSION READ] Resolved destination");
 
-                    log::debug!(
-                        "[XUDP SESSION READ] Session {} mapped to {}",
-                        session_id,
-                        resolved_destination
-                    );
+                    log::debug!("[XUDP SESSION READ] Session {} mapped", session_id);
 
                     // Successfully decoded a frame
                     if data.len() > buf.remaining() {
@@ -460,10 +444,9 @@ impl AsyncReadSessionMessage for XudpMessageStream {
 
                     buf.put_slice(&data);
                     log::debug!(
-                        "[XUDP SESSION READ] Returning {} bytes for session {} to {}",
+                        "[XUDP SESSION READ] Returning {} bytes for session {}",
                         data.len(),
-                        session_id,
-                        socket_addr
+                        session_id
                     );
                     return Poll::Ready(Ok((session_id, socket_addr)));
                 }
@@ -506,7 +489,10 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                     continue;
                 }
                 Err(e) => {
-                    log::error!("[XUDP SESSION READ] Error reading from inner stream: {}", e);
+                    log::error!(
+                        "[XUDP SESSION READ] Error reading from inner stream (kind={:?})",
+                        e.kind()
+                    );
                     return Poll::Ready(Err(e));
                 }
             }
@@ -524,16 +510,15 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         cx: &mut Context<'_>,
         session_id: MessageSessionId,
         buf: &[u8],
-        target: &SocketAddr,
+        _source: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
         // This is the reverse direction: UDP response from internet → XUDP client
         // Use original destination (may be hostname) in response frame, NOT resolved IP
 
         log::debug!(
-            "[XUDP SESSION WRITE] Writing {} bytes for session {} from source {}",
+            "[XUDP SESSION WRITE] Writing {} bytes for session {}",
             buf.len(),
-            session_id,
-            target
+            session_id
         );
 
         // Flush any pending write buffer first
@@ -552,10 +537,8 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         let target_location = route.original_destination.clone();
 
         log::debug!(
-            "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
-            target_location,
-            wire_session_id,
-            target
+            "[XUDP SESSION WRITE] Using original destination for session {}",
+            wire_session_id
         );
 
         let metadata = FrameMetadata {
@@ -567,10 +550,9 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         };
 
         log::debug!(
-            "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
+            "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, data_len={}",
             SessionStatus::Keep,
             wire_session_id,
-            target_location,
             buf.len()
         );
 
@@ -592,6 +574,7 @@ impl AsyncSessionMessageStream for XudpMessageStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::Address;
     use futures::task::noop_waker;
     use std::collections::HashSet;
     use std::io;

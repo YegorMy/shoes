@@ -215,7 +215,9 @@ impl Socks5UdpRelayStream {
             loop {
                 match recv_socket.recv_from(&mut buf).await {
                     Ok((n, from_addr)) => {
-                        log::debug!("SOCKS5 UDP relay: received {} bytes from {}", n, from_addr);
+                        // Peers, targets and sources are private, as in the
+                        // listener: log sizes and outcomes only.
+                        log::debug!("SOCKS5 UDP relay: received {} bytes", n);
                         let packet = buf[..n].to_vec().into_boxed_slice();
                         if tx.send((packet, from_addr)).await.is_err() {
                             // Channel closed, stop reading
@@ -254,25 +256,20 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                 if let Some(expected) = this.client_addr {
                     if from_addr != expected {
                         // Packet from unexpected source, ignore
-                        log::debug!(
-                            "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
-                            from_addr,
-                            expected
-                        );
+                        log::debug!("SOCKS5 UDP relay: ignoring packet from an unexpected source");
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
                 } else {
                     // Learn client address from first packet
-                    log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
+                    log::debug!("SOCKS5 UDP relay: learned client address");
                     this.client_addr = Some(from_addr);
                 }
 
                 match parse_socks5_udp_packet(&packet) {
                     Ok((target, payload)) => {
                         log::debug!(
-                            "SOCKS5 UDP relay: parsed packet, target={}, payload_len={}",
-                            target,
+                            "SOCKS5 UDP relay: parsed packet, payload_len={}",
                             payload.len()
                         );
                         // Skip empty payloads - the copy loop interprets 0-byte reads as EOF
@@ -295,7 +292,10 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                         Poll::Ready(Ok(target))
                     }
                     Err(e) => {
-                        log::debug!("SOCKS5 UDP relay: failed to parse packet: {}", e);
+                        log::debug!(
+                            "SOCKS5 UDP relay: failed to parse packet (kind={:?})",
+                            e.kind()
+                        );
                         // Try to get another packet
                         cx.waker().wake_by_ref();
                         Poll::Pending
@@ -351,10 +351,8 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
         let packet = encode_socks5_udp_packet(&source_location, buf);
 
         log::debug!(
-            "SOCKS5 UDP relay: sending {} byte response from {} to client {}",
-            packet.len(),
-            source_location,
-            client_addr
+            "SOCKS5 UDP relay: sending {} byte response to client",
+            packet.len()
         );
 
         ready!(this.socket.poll_send_to(cx, &packet, client_addr))?;

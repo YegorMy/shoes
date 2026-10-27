@@ -120,13 +120,15 @@ impl TunUdpManager {
             tokio::select! {
                 // Handle responses from destination tasks (write to TUN)
                 Some((payload, src_addr, dst_addr)) = self.response_rx.recv() => {
+                    // Remote (destination) addresses are private: the app-side local
+                    // address, sizes and kinds only.
                     debug!(
-                        "[TunUdpManager] Response: {} -> {} ({} bytes)",
-                        src_addr, dst_addr, payload.len()
+                        "[TunUdpManager] Response to {} ({} bytes)",
+                        dst_addr, payload.len()
                     );
 
                     if let Err(e) = self.write_to_tun(&payload, src_addr, dst_addr) {
-                        debug!("[TunUdpManager] Failed to write response to TUN: {}", e);
+                        debug!("[TunUdpManager] Failed to write response to TUN (kind={:?})", e.kind());
                     }
                 }
 
@@ -135,12 +137,12 @@ impl TunUdpManager {
                     match packet {
                         Some((payload, local_addr, remote_addr)) => {
                             debug!(
-                                "[TunUdpManager] Packet: {} -> {} ({} bytes)",
-                                local_addr, remote_addr, payload.len()
+                                "[TunUdpManager] Packet from {} ({} bytes)",
+                                local_addr, payload.len()
                             );
 
                             if let Err(e) = self.handle_packet(local_addr, remote_addr, payload) {
-                                debug!("[TunUdpManager] Failed to handle packet: {}", e);
+                                debug!("[TunUdpManager] Failed to handle packet (kind={:?})", e.kind());
                             }
                         }
                         None => {
@@ -320,10 +322,7 @@ async fn session_task(
                 if let Some(entry) = destinations.get(&dest)
                     && entry.handle.is_finished()
                 {
-                    debug!(
-                        "[TunUdpSession {}] Destination task for {} died, recreating",
-                        peer_addr, dest
-                    );
+                    debug!("[TunUdpSession {}] Destination task died, recreating", peer_addr);
                     destinations.remove(&dest);
                 }
 
@@ -345,16 +344,14 @@ async fn session_task(
                                 response_tx.clone(),
                             ));
 
-                            debug!(
-                                "[TunUdpSession {}] Created destination task for {}",
-                                peer_addr, dest
-                            );
+                            debug!("[TunUdpSession {}] Created destination task", peer_addr);
                             destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
                         }
                         Err(e) => {
                             debug!(
-                                "[TunUdpSession {}] Failed to connect to {}: {}",
-                                peer_addr, dest, e
+                                "[TunUdpSession {}] Failed to connect (kind={:?})",
+                                peer_addr,
+                                e.kind()
                             );
                             continue;
                         }
@@ -368,15 +365,12 @@ async fn session_task(
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         debug!(
-                            "[TunUdpSession {}] Destination queue full for {}, dropping packet",
-                            peer_addr, dest
+                            "[TunUdpSession {}] Destination queue full, dropping packet",
+                            peer_addr
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!(
-                            "[TunUdpSession {}] Destination task for {} died on send",
-                            peer_addr, dest
-                        );
+                        debug!("[TunUdpSession {}] Destination task died on send", peer_addr);
                         destinations.remove(&dest);
                     }
                 }
@@ -384,13 +378,10 @@ async fn session_task(
 
             // Remove entries whose tasks have exited (timeout, error, etc.)
             _ = cleanup_interval.tick() => {
-                destinations.retain(|dest, entry| {
+                destinations.retain(|_, entry| {
                     let alive = !entry.handle.is_finished();
                     if !alive {
-                        debug!(
-                            "[TunUdpSession {}] Removing finished destination {}",
-                            peer_addr, dest
-                        );
+                        debug!("[TunUdpSession {}] Removing finished destination", peer_addr);
                     }
                     alive
                 });
@@ -446,10 +437,7 @@ async fn destination_task(
                 }
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
 
-                debug!(
-                    "[TunUdpSession {}] Response from {}: {} bytes",
-                    peer_addr, source_addr, len
-                );
+                debug!("[TunUdpSession {}] Response: {} bytes", peer_addr, len);
 
                 // (payload, src=remote, dst=local_app)
                 if response_tx
@@ -457,15 +445,16 @@ async fn destination_task(
                     .is_err()
                 {
                     debug!(
-                        "[TunUdpSession {}] Response channel full, dropping response from {}",
-                        peer_addr, source_addr
+                        "[TunUdpSession {}] Response channel full, dropping response",
+                        peer_addr
                     );
                 }
             }
             Action::Read(Err(e)) => {
                 debug!(
-                    "[TunUdpSession {}] Read error from {}: {}",
-                    peer_addr, source_addr, e
+                    "[TunUdpSession {}] Read error (kind={:?})",
+                    peer_addr,
+                    e.kind()
                 );
                 break;
             }
@@ -477,26 +466,21 @@ async fn destination_task(
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         debug!(
-                            "[TunUdpSession {}] Send error to {}: {}",
-                            peer_addr, source_addr, e
+                            "[TunUdpSession {}] Send error (kind={:?})",
+                            peer_addr,
+                            e.kind()
                         );
                         break;
                     }
                     Err(_) => {
-                        debug!(
-                            "[TunUdpSession {}] Send timeout to {}",
-                            peer_addr, source_addr
-                        );
+                        debug!("[TunUdpSession {}] Send timeout", peer_addr);
                         break;
                     }
                 }
             }
             Action::Write(None) => break,
             Action::Timeout => {
-                debug!(
-                    "[TunUdpSession {}] Idle timeout for {}",
-                    peer_addr, source_addr
-                );
+                debug!("[TunUdpSession {}] Idle timeout", peer_addr);
                 break;
             }
         }

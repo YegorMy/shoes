@@ -63,7 +63,9 @@ async fn start_quic_server(
                 let server_handler = server_handler.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(resolver, server_handler, conn).await {
-                        error!("Connection ended with error: {e}");
+                        // Connection and chain errors can carry destinations,
+                        // server names and certificate details: kind only.
+                        error!("Connection ended with error (kind={:?})", e.kind());
                     }
                 });
             }
@@ -97,7 +99,7 @@ async fn process_connection(
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
-                error!("Failed to process streams: {e}");
+                error!("Failed to process streams (kind={:?})", e.kind());
             }
         });
     }

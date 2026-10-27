@@ -144,9 +144,6 @@ enum SessionLookup {
 
 /// A routing session (one per unique flow)
 struct RoutingSession {
-    /// The destination this session routes to
-    destination: NetLocation,
-
     /// The session's session id if this is a session UDP stream
     session_id: MessageSessionId,
 
@@ -186,14 +183,12 @@ struct RoutingSession {
 
 impl RoutingSession {
     fn new(
-        destination: NetLocation,
         session_id: MessageSessionId,
         resolved_addr: SocketAddr,
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
     ) -> Self {
         Self {
-            destination,
             session_id,
             resolved_addr,
             lookup_key,
@@ -568,15 +563,16 @@ impl<'a> UdpRouter<'a> {
             let packet = match poll_result {
                 Poll::Ready(Ok(p)) => {
                     server_read_progress = true;
+                    // Destinations and their resolved addresses are private: log sizes,
+                    // counts and outcomes only.
                     debug!(
-                        "[UdpRouter] poll_read_server got packet: {} bytes to {}",
-                        read_buf.filled().len(),
-                        p.destination
+                        "[UdpRouter] poll_read_server got packet: {} bytes",
+                        read_buf.filled().len()
                     );
                     p
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server read error: {}", e);
+                    warn!("server read error (kind={:?})", e.kind());
                     self.set_server_read_eof();
                     break;
                 }
@@ -646,7 +642,7 @@ impl<'a> UdpRouter<'a> {
                             buf = new_buf;
                         }
                         Poll::Ready(Err(e)) => {
-                            warn!("remote write error: {}", e);
+                            warn!("remote write error (kind={:?})", e.kind());
                             session.remote_write_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(*id);
@@ -660,15 +656,12 @@ impl<'a> UdpRouter<'a> {
                 None => {
                     // No session - check blocked before creating
                     if self.blocked.get(&packet.destination).is_some() {
-                        debug!("UDP proxying blocked to {}", packet.destination);
+                        debug!("UDP proxying blocked");
                         continue;
                     }
 
                     if self.pending_creates.len() >= MAX_PENDING_CREATES {
-                        debug!(
-                            "Too many pending creates, dropping new session creation for {}",
-                            packet.destination
-                        );
+                        debug!("Too many pending creates, dropping new session creation");
                         continue;
                     }
 
@@ -723,7 +716,7 @@ impl<'a> UdpRouter<'a> {
                         .push_back(PendingWrite { id, buf, len });
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("remote write error: {}", e);
+                    warn!("remote write error (kind={:?})", e.kind());
                     session.in_remote_write_queue -= 1;
                     self.remote_write_pool.release(buf);
                     session.remote_write_eof = true;
@@ -807,10 +800,7 @@ impl<'a> UdpRouter<'a> {
                 match Pin::new(&mut session.remote).poll_read_message(cx, &mut read_buf) {
                     Poll::Ready(Ok(())) => {
                         let len = read_buf.filled().len();
-                        debug!(
-                            "[UdpRouter] Read {} bytes from session remote (session {})",
-                            len, session.destination
-                        );
+                        debug!("[UdpRouter] Read {} bytes from session remote", len);
                         // An empty datagram is forwarded only when both ends carry
                         // empty messages; otherwise it keeps meaning end of stream.
                         if len == 0
@@ -833,10 +823,7 @@ impl<'a> UdpRouter<'a> {
                             session.session_id,
                         ) {
                             Poll::Ready(Ok(())) => {
-                                debug!(
-                                    "[UdpRouter] Wrote {} bytes to server (to {})",
-                                    len, session.resolved_addr
-                                );
+                                debug!("[UdpRouter] Wrote {} bytes to server", len);
                                 server_write_progress = true;
                                 // Buffer consumed and free, reuse `buf` for next burst or session
                             }
@@ -860,7 +847,7 @@ impl<'a> UdpRouter<'a> {
                                 }
                             }
                             Poll::Ready(Err(e)) => {
-                                warn!("server write error: {}", e);
+                                warn!("server write error (kind={:?})", e.kind());
                                 self.server_write_pool.release(buf); // release in-hand buffer
                                 self.set_server_write_eof();
                                 return (remote_read_progress, server_write_progress);
@@ -868,7 +855,7 @@ impl<'a> UdpRouter<'a> {
                         }
                     }
                     Poll::Ready(Err(e)) => {
-                        debug!("remote read error: {}", e);
+                        debug!("remote read error (kind={:?})", e.kind());
                         session.remote_read_eof = true;
                         if session.should_remove() {
                             self.sessions_to_remove.insert(id);
@@ -927,7 +914,7 @@ impl<'a> UdpRouter<'a> {
                     break;
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server write error: {}", e);
+                    warn!("server write error (kind={:?})", e.kind());
                     session.in_server_write_queue -= 1; // last use of session borrow
                     self.server_write_pool.release(buf); // release current buffer
                     self.set_server_write_eof(); // clears remaining queue
@@ -976,10 +963,7 @@ impl<'a> UdpRouter<'a> {
                 remote,
                 resolved_addr,
             }) => {
-                debug!(
-                    "Session created for {} (resolved to {})",
-                    destination, resolved_addr
-                );
+                debug!("Session created");
 
                 let id = self.next_session_id;
                 self.next_session_id += 1;
@@ -997,7 +981,7 @@ impl<'a> UdpRouter<'a> {
                 debug_assert!(matches!(pending_key_state.unwrap(), KeyState::Pending));
 
                 let mut session =
-                    RoutingSession::new(destination, session_id, resolved_addr, lookup_key, remote);
+                    RoutingSession::new(session_id, resolved_addr, lookup_key, remote);
 
                 // TODO: part of constructor, we now know the id in advance
                 let expiry_key = self
@@ -1009,9 +993,8 @@ impl<'a> UdpRouter<'a> {
                 // only to a remote that can carry one.
                 if !initial_data.is_empty() || !session.remote.is_message_eof() {
                     debug!(
-                        "Writing initial_data ({} bytes) to session for {}",
-                        initial_data.len(),
-                        session.destination
+                        "Writing initial_data ({} bytes) to session",
+                        initial_data.len()
                     );
                     match Pin::new(&mut session.remote).poll_write_message(cx, &initial_data) {
                         Poll::Ready(Ok(())) => {
@@ -1034,7 +1017,7 @@ impl<'a> UdpRouter<'a> {
                             }
                         }
                         Poll::Ready(Err(e)) => {
-                            warn!("remote write error: {}", e);
+                            warn!("remote write error (kind={:?})", e.kind());
                             session.remote_write_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(id);
@@ -1046,7 +1029,7 @@ impl<'a> UdpRouter<'a> {
                 true
             }
             Err(e) => {
-                warn!("Failed to create session for {}: {}", destination, e);
+                warn!("Failed to create session (kind={:?})", e.kind());
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
                     // Mark as blocked
                     self.blocked.put(destination.clone(), ());
@@ -1085,7 +1068,7 @@ impl<'a> UdpRouter<'a> {
             }
         };
 
-        debug!("Creating session for {}", destination);
+        debug!("Creating session");
 
         let initial_data = data.to_vec();
         let selector = Arc::clone(&self.selector);
@@ -1149,7 +1132,7 @@ impl<'a> UdpRouter<'a> {
     fn take_session(&mut self, id: SessionKey) -> Option<RoutingSession> {
         let mut session = self.sessions.swap_remove(&id)?;
 
-        debug!("Session removed: {}", session.destination);
+        debug!("Session removed");
 
         // Cancel expiry timer
         if let Some(key) = session.expiry_key.take() {
@@ -1176,7 +1159,7 @@ impl<'a> UdpRouter<'a> {
             let id = expired.into_inner();
             // Clear expiry_key since poll_expired already removed it from the queue
             if let Some(session) = self.sessions.get_mut(&id) {
-                debug!("Session expired: {}", session.destination);
+                debug!("Session expired");
                 session.expiry_key = None;
             }
             self.remove_session(id);
@@ -1199,7 +1182,7 @@ impl<'a> UdpRouter<'a> {
                     return true;
                 }
                 Poll::Ready(Err(e)) => {
-                    debug!("server ping error: {}", e);
+                    debug!("server ping error (kind={:?})", e.kind());
                     self.set_server_write_eof();
                 }
                 Poll::Pending => {
@@ -1224,7 +1207,7 @@ impl<'a> UdpRouter<'a> {
                 // Try to send ping immediately
                 match Pin::new(&mut session.remote).poll_write_ping(cx) {
                     Poll::Ready(Ok(_wrote_ping)) => {
-                        debug!("Sent ping to {}", session.destination);
+                        debug!("Sent ping to session remote");
                         made_progress = true;
                         session.last_write = now;
                         if !session.in_remote_flush_queue {
@@ -1233,7 +1216,7 @@ impl<'a> UdpRouter<'a> {
                         }
                     }
                     Poll::Ready(Err(e)) => {
-                        debug!("remote ping error: {}", e);
+                        debug!("remote ping error (kind={:?})", e.kind());
                         session.remote_write_eof = true;
                         if session.should_remove() {
                             self.sessions_to_remove.insert(id);
@@ -1362,7 +1345,7 @@ impl UdpRouter<'_> {
                         server_write_progress = true;
                     }
                     Poll::Ready(Err(e)) => {
-                        warn!("server flush error: {}", e);
+                        warn!("server flush error (kind={:?})", e.kind());
                         self.set_server_write_eof();
                     }
                     Poll::Pending => {}
@@ -1634,7 +1617,6 @@ mod tests {
         let state = Arc::new(RemoteState::default());
         let resolved_destination = default_destination.to_socket_addr_nonblocking().unwrap();
         let mut session = RoutingSession::new(
-            default_destination,
             1,
             resolved_destination,
             LookupKey::SessionId(1),

@@ -250,7 +250,8 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 
         match common::start_from_config(&config_str, shutdown_rx).await {
             Ok(()) => info!("Shoes service stopped normally"),
-            Err(e) => error!("Shoes service error: {}", e),
+            // Service errors can carry configuration values or destinations.
+            Err(e) => error!("Shoes service error (kind={:?})", e.kind()),
         }
 
         running_clone.store(false, Ordering::SeqCst);

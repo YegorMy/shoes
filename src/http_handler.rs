@@ -113,10 +113,8 @@ pub async fn setup_http_server_stream_inner(
                         == PROXY_AUTH_HEADER_PREFIX
                 {
                     if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                        debug!(
-                            "Received incorrect HTTP CONNECT authentication: {}",
-                            &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                        );
+                        // Presented credentials and header lines are private.
+                        debug!("Received incorrect HTTP CONNECT authentication");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -125,7 +123,7 @@ pub async fn setup_http_server_stream_inner(
                     need_auth = false;
                     continue;
                 }
-                debug!("Ignored HTTP CONNECT request header: {line}");
+                debug!("Ignored HTTP CONNECT request header ({} bytes)", line.len());
             }
 
             if need_auth {
@@ -207,10 +205,7 @@ pub async fn setup_http_server_stream_inner(
                 {
                     if need_auth {
                         if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                            debug!(
-                                "Received incorrect HTTP GET authentication: {}",
-                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                            );
+                            debug!("Received incorrect HTTP GET authentication");
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",
@@ -339,11 +334,8 @@ impl TcpClientHandler for HttpTcpClientHandler {
         let connect_location = if let Some(ref resolver) = self.resolver {
             if let Some(resolved_addr) = remote_location.resolved_addr() {
                 // Use pre-resolved address
-                debug!(
-                    "HTTP CONNECT using pre-resolved {} -> {}",
-                    remote_location.location(),
-                    resolved_addr
-                );
+                // Destinations and resolved addresses are private.
+                debug!("HTTP CONNECT using pre-resolved address");
                 let address = match resolved_addr.ip() {
                     std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
                     std::net::IpAddr::V6(ip) => Address::Ipv6(ip),
@@ -352,11 +344,7 @@ impl TcpClientHandler for HttpTcpClientHandler {
             } else if remote_location.address().hostname().is_some() {
                 let socket_addr =
                     resolve_single_address(resolver, remote_location.location()).await?;
-                debug!(
-                    "HTTP CONNECT resolved {} -> {}",
-                    remote_location.location(),
-                    socket_addr
-                );
+                debug!("HTTP CONNECT resolved destination");
                 let address = match socket_addr.ip() {
                     std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
                     std::net::IpAddr::V6(ip) => Address::Ipv6(ip),

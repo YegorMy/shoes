@@ -138,7 +138,7 @@ async fn process_connection(
 
     // Per sing-box reference (service.go:277-293), close connection on error
     if let Err(ref e) = result {
-        error!("Connection failed: {e}");
+        error!("Connection failed (kind={:?})", e.kind());
         connection.close(CLOSE_ERR_CODE_OK.into(), b"");
     }
 
@@ -226,7 +226,11 @@ async fn auth_connection(
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Received non-hysteria2 auth http3 request: {e}");
+                        // The authentication error carries the presented credential.
+                        error!(
+                            "Received non-hysteria2 auth http3 request (kind={:?})",
+                            e.kind()
+                        );
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::NOT_FOUND)
                             .body(())
@@ -307,7 +311,10 @@ impl UdpSession {
             )
             .await
             {
-                error!("UDP remote-to-local write loop ended with error: {e}");
+                error!(
+                    "UDP remote-to-local write loop ended with error (kind={:?})",
+                    e.kind()
+                );
             }
         });
 
@@ -527,7 +534,8 @@ async fn run_udp_local_to_remote_loop(
         let remote_location = match NetLocation::from_str(addr_str, None) {
             Ok(loc) => loc,
             Err(e) => {
-                debug!("Failed to parse address '{addr_str}': {e}");
+                // The address is the requested destination: log the kind only.
+                debug!("Failed to parse address (kind={:?})", e.kind());
                 continue;
             }
         };
@@ -545,11 +553,11 @@ async fn run_udp_local_to_remote_loop(
                         remote_location,
                     }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {remote_location}");
+                        warn!("Blocked UDP forward");
                         continue;
                     }
                     Err(e) => {
-                        error!("Failed to judge UDP forward to {remote_location}: {e}");
+                        error!("Failed to judge UDP forward (kind={:?})", e.kind());
                         continue;
                     }
                 };
@@ -576,7 +584,10 @@ async fn run_udp_local_to_remote_loop(
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("Failed to resolve initial remote location {remote_location}: {e}");
+                        error!(
+                            "Failed to resolve initial remote location (kind={:?})",
+                            e.kind()
+                        );
                         continue;
                     }
                 };
@@ -678,10 +689,7 @@ async fn run_udp_local_to_remote_loop(
                 if remote_location == session.last_location {
                     session.last_socket_addr
                 } else {
-                    warn!(
-                        "Location changed during ongoing UDP session: {}",
-                        remote_location.clone()
-                    );
+                    warn!("Location changed during ongoing UDP session");
                     let action = client_proxy_selector
                         .judge(remote_location.clone().into(), &resolver)
                         .await;
@@ -691,11 +699,11 @@ async fn run_udp_local_to_remote_loop(
                             remote_location,
                         }) => remote_location,
                         Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
+                            warn!("Blocked UDP forward");
                             continue;
                         }
                         Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
+                            error!("Failed to judge UDP forward (kind={:?})", e.kind());
                             continue;
                         }
                     };
@@ -706,8 +714,8 @@ async fn run_udp_local_to_remote_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(
-                                "Failed to resolve updated remote location {}: {e}",
-                                updated_location.location()
+                                "Failed to resolve updated remote location (kind={:?})",
+                                e.kind()
                             );
                             continue;
                         }
@@ -724,7 +732,10 @@ async fn run_udp_local_to_remote_loop(
             .send_to(&complete_payload, socket_addr)
             .await
         {
-            error!("Failed to forward UDP payload for session {session_id}: {e}");
+            error!(
+                "Failed to forward UDP payload for session {session_id} (kind={:?})",
+                e.kind()
+            );
             sessions.remove(&session_id);
         }
     }
@@ -757,7 +768,7 @@ async fn run_tcp_loop(
             if let Err(e) =
                 process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {
-                error!("Failed to process streams: {e}");
+                error!("Failed to process streams (kind={:?})", e.kind());
             }
         });
     }
@@ -1042,7 +1053,7 @@ pub async fn start_hysteria2_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {e}");
+                        error!("Connection ended with error (kind={:?})", e.kind());
                     }
                 });
             }

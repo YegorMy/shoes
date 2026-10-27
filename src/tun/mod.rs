@@ -133,13 +133,14 @@ pub async fn run_tun_server(
                     let remote_addr = new_conn.remote_addr;
                     let target = socket_addr_to_net_location(remote_addr);
 
-                    debug!("Handling TCP connection to {:?}", target);
+                    // Destinations and chain errors are private: kinds and counts only.
+                    debug!("Handling TCP connection");
 
                     if let Err(e) =
                         handle_tcp_connection(new_conn.connection, target, proxy_selector, resolver)
                             .await
                     {
-                        debug!("TCP connection to {} failed: {}", remote_addr, e);
+                        debug!("TCP connection failed (kind={:?})", e.kind());
                     }
                 });
             }
@@ -214,20 +215,14 @@ async fn handle_tcp_connection(
             chain_group,
             remote_location,
         } => {
-            debug!(
-                "TCP: connecting to {} via chain",
-                remote_location.location()
-            );
+            debug!("TCP: connecting via chain");
 
             match chain_group
                 .connect_tcp(remote_location.clone(), &resolver)
                 .await
             {
                 Ok(setup_result) => {
-                    debug!(
-                        "TCP: connected to {}, starting bidirectional copy",
-                        remote_location.location()
-                    );
+                    debug!("TCP: connected, starting bidirectional copy");
 
                     let mut remote = setup_result.client_stream;
                     let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
@@ -235,25 +230,19 @@ async fn handle_tcp_connection(
                     match result {
                         Ok((client_to_remote, remote_to_client)) => {
                             debug!(
-                                "TCP connection to {} completed: {} bytes sent, {} bytes received",
-                                remote_location.location(),
-                                client_to_remote,
-                                remote_to_client
+                                "TCP connection completed: {} bytes sent, {} bytes received",
+                                client_to_remote, remote_to_client
                             );
                         }
                         Err(e) => {
-                            debug!(
-                                "TCP connection to {} error: {}",
-                                remote_location.location(),
-                                e
-                            );
+                            debug!("TCP connection error (kind={:?})", e.kind());
                         }
                     }
 
                     Ok(())
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote_location.location(), e);
+                    warn!("Failed to connect via chain (kind={:?})", e.kind());
                     Err(e)
                 }
             }
@@ -285,7 +274,7 @@ async fn handle_udp_packets(
     let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver);
 
     if let Err(e) = manager.run().await {
-        warn!("UDP handler error: {}", e);
+        warn!("UDP handler error (kind={:?})", e.kind());
     }
 
     info!("UDP handler stopped");
@@ -301,7 +290,7 @@ pub async fn start_tun_server(
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
         if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
-            warn!("TUN server error: {}", e);
+            warn!("TUN server error (kind={:?})", e.kind());
         }
     });
 

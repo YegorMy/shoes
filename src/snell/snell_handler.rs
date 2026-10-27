@@ -203,7 +203,7 @@ impl TcpServerHandler for SnellServerHandler {
                     )
                     .await
                     {
-                        debug!("Snell h2mux session ended: {}", e);
+                        debug!("Snell h2mux session ended (kind={:?})", e.kind());
                     }
                 });
 

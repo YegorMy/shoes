@@ -310,10 +310,7 @@ impl SocketConnector for SocketConnectorImpl {
         resolver: &Arc<dyn Resolver>,
         mut target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
-        debug!(
-            "[SocketConnector] connect_udp_bidirectional called, target: {}",
-            target.location()
-        );
+        debug!("[SocketConnector] connect_udp_bidirectional called");
 
         let remote_addr = resolve_location(&mut target, resolver).await?;
         let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;

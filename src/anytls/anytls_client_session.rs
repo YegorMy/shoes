@@ -234,7 +234,7 @@ impl AnyTlsClientSession {
                 result = Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w.clone()) => result,
             };
             if let Err(e) = result {
-                log::debug!("AnyTLS client writer ended: {}", e);
+                log::debug!("AnyTLS client writer ended (kind={:?})", e.kind());
             }
         });
 
@@ -243,7 +243,7 @@ impl AnyTlsClientSession {
         let close_notify_r = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
             if let Err(e) = Self::reader_loop(session_weak_r, reader, close_notify_r).await {
-                log::debug!("AnyTLS client reader ended: {}", e);
+                log::debug!("AnyTLS client reader ended (kind={:?})", e.kind());
             }
         });
     }
@@ -503,7 +503,7 @@ impl AnyTlsClientSession {
                         frame.data.len()
                     );
                     if let Err(e) = session.handle_frame(frame).await {
-                        log::warn!("AnyTLS client error handling frame: {}", e);
+                        log::warn!("AnyTLS client error handling frame (kind={:?})", e.kind());
                         return Err(e);
                     }
                 }
@@ -635,7 +635,8 @@ impl AnyTlsClientSession {
             Command::Alert => {
                 // Server alert - fatal
                 let msg = String::from_utf8_lossy(&frame.data);
-                log::warn!("AnyTLS server alert: {}", msg);
+                // Peer-supplied text is not logged: its length only.
+                log::warn!("AnyTLS server alert ({} bytes)", frame.data.len());
                 self.is_closed.store(true, Ordering::Relaxed);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,

@@ -220,7 +220,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     None => session.await,
                 };
                 if let Err(e) = result {
-                    debug!("Shadowsocks h2mux session ended: {}", e);
+                    debug!("Shadowsocks h2mux session ended (kind={:?})", e.kind());
                 }
             });
 
@@ -268,7 +268,8 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
                 // Reads destination address using SOCKS address format
                 let destination = read_location(&mut server_stream, &mut stream_reader).await?;
-                log::debug!("Shadowsocks UoT V2: destination = {:?}", destination);
+                // Destinations are private.
+                log::debug!("Shadowsocks UoT V2: destination parsed");
 
                 if is_connect == 1 {
                     // V2 Connect mode: Single destination, length-prefixed packets only

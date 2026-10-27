@@ -78,12 +78,13 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     fallback: &NetLocation,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<TcpServerSetupResult> {
-    debug!("VLESS FALLBACK: Connecting to fallback: {}", fallback);
+    // Fallback and requested destinations are private.
+    debug!("VLESS FALLBACK: Connecting to fallback");
 
     let unconsumed_data = reader.unparsed_data();
     let dest_addr = crate::resolver::resolve_single_address(resolver, fallback).await?;
 
-    debug!("VLESS FALLBACK: Resolved {} to {}", fallback, dest_addr);
+    debug!("VLESS FALLBACK: Resolved fallback");
 
     let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
 
@@ -116,7 +117,7 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
         let _ = dest_stream.shutdown().await;
 
         if let Err(e) = result {
-            debug!("VLESS FALLBACK: Connection ended: {}", e);
+            debug!("VLESS FALLBACK: Connection ended (kind={:?})", e.kind());
         } else {
             debug!("VLESS FALLBACK: Connection completed");
         }
@@ -210,7 +211,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                         )
                         .await
                         {
-                            debug!("H2MUX session ended: {}", e);
+                            debug!("H2MUX session ended (kind={:?})", e.kind());
                         }
                     });
 
@@ -355,7 +356,7 @@ where
             debug!("Parsing remote location...");
             let remote_location =
                 parse_remote_location_from_reader(&mut stream_reader, &mut tls_stream).await?;
-            debug!("Remote location parsed: {}", remote_location);
+            debug!("Remote location parsed");
             let unparsed_data = stream_reader.unparsed_data();
 
             let flow_stream: Box<dyn AsyncStream> = if flow == XTLS_VISION_FLOW {
@@ -392,7 +393,7 @@ where
             debug!("Parsing remote location...");
             let remote_location =
                 parse_remote_location_from_reader(&mut stream_reader, &mut tls_stream).await?;
-            debug!("Remote location parsed: {}", remote_location);
+            debug!("Remote location parsed");
             let unparsed_data = stream_reader.unparsed_data();
 
             write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;

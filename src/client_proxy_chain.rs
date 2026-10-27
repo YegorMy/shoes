@@ -345,10 +345,9 @@ impl ClientProxyChain {
             let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
             let entry = &self.initial_hop[pool_idx];
 
-            debug!(
-                "Chain UDP connect: 1 hop (initial IS final), target={}",
-                target.location()
-            );
+            // Targets and hop endpoints are private, as in the TCP chain:
+            // log hop shapes and counts only.
+            debug!("Chain UDP connect: 1 hop (initial IS final)");
 
             match entry {
                 InitialHopEntry::Direct(socket) => {
@@ -356,10 +355,7 @@ impl ClientProxyChain {
                     socket.connect_udp_bidirectional(resolver, target).await
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
-                    debug!(
-                        "Chain UDP: Proxy {} (UDP, no subsequent)",
-                        proxy.proxy_location()
-                    );
+                    debug!("Chain UDP: Proxy (UDP, no subsequent)");
                     let proxy_loc = proxy.proxy_location().into();
                     let stream = socket.connect(resolver, &proxy_loc).await?;
                     proxy.setup_udp_bidirectional(stream, target).await
@@ -398,9 +394,8 @@ impl ClientProxyChain {
             let final_proxy = final_hop_pool[pool_idx].as_ref();
 
             debug!(
-                "Chain UDP connect: 1 initial + {} intermediate + 1 final (UDP) hop(s), target={}",
-                intermediate_proxies.len(),
-                target.location()
+                "Chain UDP connect: 1 initial + {} intermediate + 1 final (UDP) hop(s)",
+                intermediate_proxies.len()
             );
 
             // Build the chain: initial -> intermediates -> final (UDP)
@@ -414,7 +409,7 @@ impl ClientProxyChain {
                             final_proxy.proxy_location().into()
                         };
 
-                    debug!("Chain UDP: Direct -> {} (TCP)", first_target.location());
+                    debug!("Chain UDP: Direct -> next hop (TCP)");
                     let mut stream = socket.connect(resolver, &first_target).await?;
 
                     // Process intermediate hops (all TCP)
@@ -424,21 +419,16 @@ impl ClientProxyChain {
                             .map(|p| p.proxy_location().into())
                             .unwrap_or_else(|| final_proxy.proxy_location().into());
                         debug!(
-                            "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
+                            "Chain UDP intermediate hop {}/{} (TCP)",
                             i + 1,
-                            intermediate_proxies.len(),
-                            proxy.proxy_location(),
-                            next_target.location()
+                            intermediate_proxies.len()
                         );
                         let result = proxy.setup_tcp_stream(stream, &next_target).await?;
                         stream = result.client_stream;
                     }
 
                     // Final hop: UDP stream
-                    debug!(
-                        "Chain UDP final hop: {} (UDP)",
-                        final_proxy.proxy_location()
-                    );
+                    debug!("Chain UDP final hop (UDP)");
                     final_proxy.setup_udp_bidirectional(stream, target).await
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
@@ -450,11 +440,7 @@ impl ClientProxyChain {
                             final_proxy.proxy_location().into()
                         };
 
-                    debug!(
-                        "Chain UDP: Proxy {} -> {} (TCP)",
-                        proxy.proxy_location(),
-                        first_target.location()
-                    );
+                    debug!("Chain UDP: Proxy -> next hop (TCP)");
                     let proxy_loc = proxy.proxy_location().into();
                     let stream = socket.connect(resolver, &proxy_loc).await?;
                     let result = proxy.setup_tcp_stream(stream, &first_target).await?;
@@ -467,21 +453,16 @@ impl ClientProxyChain {
                             .map(|p| p.proxy_location().into())
                             .unwrap_or_else(|| final_proxy.proxy_location().into());
                         debug!(
-                            "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
+                            "Chain UDP intermediate hop {}/{} (TCP)",
                             i + 1,
-                            intermediate_proxies.len(),
-                            proxy.proxy_location(),
-                            next_target.location()
+                            intermediate_proxies.len()
                         );
                         let result = proxy.setup_tcp_stream(stream, &next_target).await?;
                         stream = result.client_stream;
                     }
 
                     // Final hop: UDP stream
-                    debug!(
-                        "Chain UDP final hop: {} (UDP)",
-                        final_proxy.proxy_location()
-                    );
+                    debug!("Chain UDP final hop (UDP)");
                     final_proxy.setup_udp_bidirectional(stream, target).await
                 }
             }

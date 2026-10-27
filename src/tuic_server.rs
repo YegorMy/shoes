@@ -151,7 +151,7 @@ async fn process_connection(
 
     // Per sing-box reference (service.go:382-398), close connection on error
     if let Err(ref e) = result {
-        error!("Connection failed: {e}");
+        error!("Connection failed (kind={:?})", e.kind());
         connection.close(0u32.into(), b"");
     }
 
@@ -275,12 +275,15 @@ async fn run_bidirectional_loop(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     // Per official TUIC reference (handle_stream.rs:127-135),
                     // header parsing errors close the connection
-                    error!("Error parsing TCP stream header, closing connection: {e}");
+                    error!(
+                        "Error parsing TCP stream header, closing connection (kind={:?})",
+                        e.kind()
+                    );
                     conn.close(0u32.into(), b"");
                 }
                 Err(e) => {
                     // TCP proxying errors are just logged (handle_task.rs:238-246)
-                    error!("Error processing TCP stream: {e}");
+                    error!("Error processing TCP stream (kind={:?})", e.kind());
                 }
             }
         });
@@ -526,7 +529,10 @@ impl UdpSession {
             )
             .await
             {
-                error!("UDP remote-to-local write loop ended with error: {e}");
+                error!(
+                    "UDP remote-to-local write loop ended with error (kind={:?})",
+                    e.kind()
+                );
             }
         });
 
@@ -566,7 +572,10 @@ impl UdpSession {
             )
             .await
             {
-                error!("UDP remote-to-local write loop ended with error: {e}");
+                error!(
+                    "UDP remote-to-local write loop ended with error (kind={:?})",
+                    e.kind()
+                );
             }
         });
 
@@ -605,7 +614,10 @@ impl UdpSession {
                         match resolve_single_address(resolver, updated_location.location()).await {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("Failed to resolve updated remote location {location}: {e}");
+                                error!(
+                                    "Failed to resolve updated remote location (kind={:?})",
+                                    e.kind()
+                                );
                                 return Err(e);
                             }
                         };
@@ -896,7 +908,10 @@ async fn run_unidirectional_loop(
                 Err(e) => {
                     // Per official TUIC reference (handle_stream.rs:70-78),
                     // uni stream errors close the connection
-                    error!("Error processing uni stream, closing connection: {e}");
+                    error!(
+                        "Error processing uni stream, closing connection (kind={:?})",
+                        e.kind()
+                    );
                     connection.close(0u32.into(), b"");
                 }
             }
@@ -1132,7 +1147,10 @@ async fn process_udp_packet(
             .send_to(payload_fragment, socket_addr)
             .await
         {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
+            error!(
+                "Failed to forward UDP payload for session {assoc_id} (kind={:?})",
+                e.kind()
+            );
             drop(session);
             udp_session_map.remove(&assoc_id);
             return Ok(());
@@ -1230,7 +1248,10 @@ async fn process_udp_packet(
             .send_to(&complete_payload, socket_addr)
             .await
         {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
+            error!(
+                "Failed to forward UDP payload for session {assoc_id} (kind={:?})",
+                e.kind()
+            );
             drop(session);
             udp_session_map.remove(&assoc_id);
             return Ok(());
@@ -1385,7 +1406,10 @@ async fn run_datagram_loop(
         )
         .await
         {
-            error!("Failed to process datagram UDP packet: {e}");
+            error!(
+                "Failed to process datagram UDP packet (kind={:?})",
+                e.kind()
+            );
         }
     }
 }
@@ -1462,7 +1486,9 @@ pub async fn start_tuic_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {e}");
+                        // Authentication errors carry the presented UUID, and chain errors
+                        // destinations: log the kind only.
+                        error!("Connection ended with error (kind={:?})", e.kind());
                     }
                 });
             }

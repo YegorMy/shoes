@@ -148,10 +148,7 @@ impl H2MuxClientStream {
             STATUS_SUCCESS => {
                 self.recv_buf = self.recv_buf.slice(1..);
                 self.response_read = true;
-                log::debug!(
-                    "H2MuxClientStream: stream to {} opened successfully",
-                    self.destination
-                );
+                log::debug!("H2MuxClientStream: stream opened successfully");
                 Ok(())
             }
             STATUS_ERROR => {

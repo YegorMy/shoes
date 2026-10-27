@@ -142,10 +142,10 @@ impl NaiveClientSession {
             .await
             .map_err(|e| io::Error::other(format!("CONNECT response error: {}", e)))?;
 
+        // Response headers can carry server-chosen values: status only.
         debug!(
-            "NaiveClientSession: CONNECT response: status={}, headers={:?}",
-            response.status(),
-            response.headers()
+            "NaiveClientSession: CONNECT response: status={}",
+            response.status()
         );
 
         if response.status() != http::StatusCode::OK {
@@ -187,7 +187,7 @@ impl NaiveClientSession {
             Box::new(h2_stream)
         };
 
-        debug!("NaiveClientSession: opened stream to {}", target);
+        debug!("NaiveClientSession: opened stream");
 
         Ok(client_stream)
     }

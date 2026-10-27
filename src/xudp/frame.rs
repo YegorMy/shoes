@@ -200,11 +200,11 @@ impl FrameMetadata {
         buf.advance(2);
 
         if metadata_len < 4 {
+            // Frame bytes may be payload: lengths only.
             log::error!(
-                "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes, first 8 bytes: {:?})",
+                "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes)",
                 metadata_len,
-                buf.len() + 2,
-                &buf[..std::cmp::min(8, buf.len())]
+                buf.len() + 2
             );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
