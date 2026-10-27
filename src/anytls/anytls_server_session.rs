@@ -270,6 +270,15 @@ impl AnyTlsSession {
         )
     }
 
+    /// Legacy streams still registered, and legacy stream tasks still tracked.
+    #[cfg(test)]
+    pub(super) async fn legacy_resources_for_test(&self) -> (usize, usize) {
+        (
+            self.streams.read().await.len(),
+            self.stream_tasks.lock().await.len(),
+        )
+    }
+
     /// Close the session
     pub async fn close(&self) {
         if self

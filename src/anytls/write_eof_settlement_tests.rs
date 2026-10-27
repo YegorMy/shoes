@@ -1,6 +1,7 @@
 //! Transport-failure settlement of backpressured sessions over real TCP, real
 //! TLS, the real AnyTLS handler and a real destination socket.
 use super::anytls_server_session::AnyTlsSession;
+use super::anytls_stream::STREAM_CHANNEL_BUFFER;
 use super::anytls_types::{Command, Frame};
 use super::write_eof_offer_tests::{
     BOUND, Io, PASSWORD, Tls, client_tls, direct_group, direct_selector, location, tls, tls_from,
@@ -20,13 +21,14 @@ use bytes::{Bytes, BytesMut};
 use std::{
     io,
     net::SocketAddr,
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
@@ -43,10 +45,11 @@ const RAW_CHUNK: usize = 32 * 1024;
 // Small socket buffers keep the backpressure point independent of OS autotuning.
 const SMALL_BUFFER: u32 = 32 * 1024;
 
-// The only helpers that name the transport-failure API.
+// The only helpers that name the transport-failure API. A session in these
+// tests always has a watch: failing to create one fails the test.
 type Watch = Option<crate::transport_watch::TransportWatch>;
 fn watch(tcp: &TcpStream) -> Watch {
-    crate::transport_watch::TransportWatch::tcp(tcp).ok()
+    Some(crate::transport_watch::TransportWatch::tcp(tcp).expect("transport watch"))
 }
 fn attach(session: &AnyTlsSession, watch: Watch) {
     session.watch_transport(watch);
@@ -214,17 +217,27 @@ fn upload(stream: AnyTlsStream, size: usize) -> Upload<ReadHalf<AnyTlsStream>> {
     }
 }
 
-/// Raw v2 wire client. Shoes' own legacy client queues writes without bound
-/// (`AnyTlsClientSession` uses an unbounded channel), so it never stalls; this
-/// writes frames straight to TLS and stalls with the transport. A negotiated
-/// client offers write-eof/1 and ends its stream with WRITE_EOF. Either ends
-/// the upload with TLS close_notify and TCP FIN.
-async fn raw_upload(
+/// Upload bytes at offsets `start..start + len`: each 4-byte word is the
+/// big-endian index of that word, so content, order and offset are checkable.
+fn upload_bytes(start: usize, len: usize) -> Vec<u8> {
+    (start..start + len)
+        .map(|offset| (offset as u32 / 4).to_be_bytes()[offset % 4])
+        .collect()
+}
+
+/// Raw v2 wire client: authenticates and opens stream 1 to `target`, offering
+/// write-eof/1 when `negotiated`. Shoes' own legacy client queues writes
+/// without bound (`AnyTlsClientSession` uses an unbounded channel), so it never
+/// stalls; a raw client writes frames straight to TLS and stalls with the
+/// transport.
+async fn raw_open(
     mut transport: Box<dyn AsyncStream>,
     target: SocketAddr,
-    size: usize,
     negotiated: bool,
-) -> Upload<ReadHalf<Box<dyn AsyncStream>>> {
+) -> (
+    ReadHalf<Box<dyn AsyncStream>>,
+    WriteHalf<Box<dyn AsyncStream>>,
+) {
     let mut password = [0; 32];
     password.copy_from_slice(
         aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, PASSWORD.as_bytes()).as_ref(),
@@ -237,36 +250,63 @@ async fn raw_upload(
     .await
     .unwrap();
     let (reader, mut writer) = tokio::io::split(transport);
+    let settings: &'static [u8] = if negotiated {
+        b"v=2\nx-write-eof=1"
+    } else {
+        b"v=2"
+    };
+    let mut head = BytesMut::new();
+    Frame::with_data(Command::Settings, 0, Bytes::from_static(settings)).encode_into(&mut head);
+    Frame::control(Command::Syn, 1).encode_into(&mut head);
+    Frame::with_data(
+        Command::Psh,
+        1,
+        write_location_to_vec(&location(target)).into(),
+    )
+    .encode_into(&mut head);
+    writer.write_all(&head).await.unwrap();
+    (reader, writer)
+}
+
+/// Writes the frame of [`upload_bytes`] that starts at `offset`.
+async fn write_upload_frame(
+    writer: &mut WriteHalf<Box<dyn AsyncStream>>,
+    offset: usize,
+    chunk: usize,
+) -> io::Result<()> {
+    let frame = Frame::data(1, Bytes::from(upload_bytes(offset, chunk))).encode();
+    writer.write_all(&frame).await?;
+    writer.flush().await
+}
+
+/// Ends stream 1 (WRITE_EOF when negotiated), then TLS close_notify and TCP FIN.
+async fn raw_end(writer: &mut WriteHalf<Box<dyn AsyncStream>>, negotiated: bool) -> io::Result<()> {
+    if negotiated {
+        writer
+            .write_all(&Frame::control(Command::WriteEof, 1).encode())
+            .await?;
+    }
+    writer.shutdown().await
+}
+
+/// Uploads `size` bytes in `chunk`-byte frames of [`upload_bytes`] over a raw
+/// client, then ends the stream as [`raw_end`] does.
+async fn raw_upload(
+    transport: Box<dyn AsyncStream>,
+    target: SocketAddr,
+    size: usize,
+    negotiated: bool,
+    chunk: usize,
+) -> Upload<ReadHalf<Box<dyn AsyncStream>>> {
+    let (reader, mut writer) = raw_open(transport, target, negotiated).await;
     let progress = Arc::new(AtomicUsize::new(0));
     let accepted = progress.clone();
     let task = tokio::spawn(async move {
-        let settings: &'static [u8] = if negotiated {
-            b"v=2\nx-write-eof=1"
-        } else {
-            b"v=2"
-        };
-        let mut head = BytesMut::new();
-        Frame::with_data(Command::Settings, 0, Bytes::from_static(settings)).encode_into(&mut head);
-        Frame::control(Command::Syn, 1).encode_into(&mut head);
-        Frame::with_data(
-            Command::Psh,
-            1,
-            write_location_to_vec(&location(target)).into(),
-        )
-        .encode_into(&mut head);
-        writer.write_all(&head).await?;
-        let frame = Frame::data(1, Bytes::from(vec![b'U'; RAW_CHUNK])).encode();
         while accepted.load(SeqCst) < size {
-            writer.write_all(&frame).await?;
-            writer.flush().await?;
-            accepted.fetch_add(RAW_CHUNK, SeqCst);
+            write_upload_frame(&mut writer, accepted.load(SeqCst), chunk).await?;
+            accepted.fetch_add(chunk, SeqCst);
         }
-        if negotiated {
-            writer
-                .write_all(&Frame::control(Command::WriteEof, 1).encode())
-                .await?;
-        }
-        writer.shutdown().await
+        raw_end(&mut writer, negotiated).await
     });
     Upload {
         progress,
@@ -280,7 +320,7 @@ async fn raw_legacy_upload(
     target: SocketAddr,
     size: usize,
 ) -> Upload<ReadHalf<Box<dyn AsyncStream>>> {
-    raw_upload(transport, target, size, false).await
+    raw_upload(transport, target, size, false, RAW_CHUNK).await
 }
 
 /// Wait until the upload stops making progress: the session is backpressured.
@@ -622,8 +662,58 @@ async fn legacy_backpressured_reset_settles_through_shoes_config() {
 // and ends cleanly.
 
 /// Requested server receive buffer: the FIN must fit behind the queued upload.
+/// The kernel may grant less (Linux caps it at `net.core.rmem_max`); the guard
+/// never relies on this figure, only on what the kernel actually queues.
 const FIN_RECEIVE_BUFFER: u32 = 1024 * 1024;
 const FIN_RESPONSE: usize = 4 * 1024;
+/// Frame payload for the guards: small, so a legacy close drops little.
+const FIN_CHUNK: usize = 2 * 1024;
+/// The most a legacy session drops when it reaches the FIN and aborts its
+/// stream: a full stream queue, one partly read frame, and the relay's copy
+/// buffer (16 KiB in `copy_bidirectional`).
+const LEGACY_LOSS_BOUND: usize = (STREAM_CHANNEL_BUFFER + 1) * FIN_CHUNK + 16 * 1024;
+/// Upload left in the server's kernel behind the parked reader when the client
+/// sends its FIN: more than a legacy close may drop, so discarding that
+/// remainder fails the legacy bound.
+const PARKED_QUEUE: usize = 2 * LEGACY_LOSS_BOUND;
+
+/// Bytes waiting in a socket's kernel receive queue.
+fn receive_queued(socket: &OwnedFd) -> usize {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: FIONREAD stores one int through the pointer.
+    let result = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut queued) };
+    assert_eq!(result, 0, "FIONREAD: {}", io::Error::last_os_error());
+    queued as usize
+}
+
+/// Bytes in a socket's kernel send queue that the peer has not acknowledged.
+#[cfg(target_os = "linux")]
+fn send_queued(socket: &OwnedFd) -> usize {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ (SIOCOUTQ) stores one int through the pointer.
+    let result = unsafe { libc::ioctl(socket.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+    assert_eq!(result, 0, "TIOCOUTQ: {}", io::Error::last_os_error());
+    queued as usize
+}
+
+/// Bytes in a socket's kernel send buffer (sent but unacknowledged included).
+#[cfg(target_vendor = "apple")]
+fn send_queued(socket: &OwnedFd) -> usize {
+    let mut queued: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: SO_NWRITE stores one int; `len` holds its size.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            (&mut queued as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(result, 0, "SO_NWRITE: {}", io::Error::last_os_error());
+    queued as usize
+}
 
 /// A destination that first sends a response and its write EOF (a negotiated
 /// session settles gracefully only once both directions ended), then reads
@@ -647,19 +737,53 @@ fn held_destination(respond: bool) -> (SocketAddr, CancellationToken, JoinHandle
     (addr, resume, task)
 }
 
+/// Uploads until the session reader is parked: frames go out until more than
+/// [`PARKED_QUEUE`] bytes wait in the server's kernel and that queue stops
+/// draining. The queue is read in the same run from a duplicate of the server
+/// socket, so neither reported buffer sizes nor autotuning between runs
+/// matter. Then ends the stream and sends close_notify and FIN, which queue
+/// behind that upload. Returns the number of upload bytes.
+fn parking_upload(
+    mut writer: WriteHalf<Box<dyn AsyncStream>>,
+    negotiated: bool,
+    server_socket: Arc<OwnedFd>,
+) -> JoinHandle<io::Result<usize>> {
+    tokio::spawn(async move {
+        let mut written = 0;
+        loop {
+            while receive_queued(&server_socket) <= PARKED_QUEUE {
+                write_upload_frame(&mut writer, written, FIN_CHUNK).await?;
+                written += FIN_CHUNK;
+            }
+            // The reader is parked once it stops taking from the queue.
+            let queued = receive_queued(&server_socket);
+            sleep(Duration::from_millis(300)).await;
+            if receive_queued(&server_socket) >= queued {
+                break;
+            }
+        }
+        raw_end(&mut writer, negotiated).await?;
+        Ok(written)
+    })
+}
+
 struct FinCase {
     session: Arc<AnyTlsSession>,
     server: JoinHandle<io::Result<()>>,
-    upload: Upload<ReadHalf<Box<dyn AsyncStream>>>,
+    // Kept open until the end: the client reads nothing, and dropping a
+    // socket with unread data would reset the connection.
+    _reader: ReadHalf<Box<dyn AsyncStream>>,
+    upload: JoinHandle<io::Result<usize>>,
     resume: CancellationToken,
     destination: JoinHandle<Vec<u8>>,
-    // Effective client send and server receive buffer sizes.
-    buffers: (usize, usize),
+    // Duplicates of the two TCP sockets, only for reading their kernel queues.
+    server_socket: Arc<OwnedFd>,
+    client_socket: OwnedFd,
 }
 
-/// A hand-built session behind Shoes' transport watch, uploading `size` bytes
+/// A hand-built session behind Shoes' transport watch, with a parking upload
 /// to a held destination over a small client socket and a large server one.
-async fn fin_case(negotiated: bool, size: usize) -> FinCase {
+async fn fin_case(negotiated: bool) -> FinCase {
     let tls = tls();
     let socket = small_socket();
     socket.set_recv_buffer_size(FIN_RECEIVE_BUFFER).unwrap();
@@ -670,7 +794,7 @@ async fn fin_case(negotiated: bool, size: usize) -> FinCase {
     let (created, created_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        let received = socket2::SockRef::from(&tcp).recv_buffer_size().unwrap();
+        let server_socket = tcp.as_fd().try_clone_to_owned().unwrap();
         let watch = watch(&tcp);
         let mut transport = acceptor.accept(tcp).await.unwrap();
         let mut hash = [0; 32];
@@ -692,59 +816,38 @@ async fn fin_case(negotiated: bool, size: usize) -> FinCase {
         session.enable_write_eof(negotiated);
         attach(&session, watch);
         created
-            .send((session.clone(), received))
+            .send((session.clone(), server_socket))
             .unwrap_or_else(|_| panic!("test receiver closed"));
         session.run_until_cancelled(None).await
     });
     let (target, resume, destination) = held_destination(negotiated);
-    let client = small_socket();
-    let sent = client.send_buffer_size().unwrap() as usize;
-    let transport = client_tls(&tls, client.connect(addr).await.unwrap()).await;
-    let upload = raw_upload(transport, target, size, negotiated).await;
-    let (session, received) = created_rx.await.unwrap();
+    let client = small_socket().connect(addr).await.unwrap();
+    let client_socket = client.as_fd().try_clone_to_owned().unwrap();
+    let transport = client_tls(&tls, client).await;
+    let (reader, writer) = raw_open(transport, target, negotiated).await;
+    let (session, server_socket) = created_rx.await.unwrap();
+    let server_socket = Arc::new(server_socket);
+    let upload = parking_upload(writer, negotiated, server_socket.clone());
     FinCase {
         session,
         server,
+        _reader: reader,
         upload,
         resume,
         destination,
-        buffers: (sent, received),
+        server_socket,
+        client_socket,
     }
-}
-
-/// Upload size that parks the reader with room left for the FIN: what the
-/// server consumes before parking plus half of its receive buffer. Measured
-/// on this host with an otherwise identical session (kernel send buffers on
-/// the destination path are autotuned and differ between hosts).
-async fn fin_upload_size(negotiated: bool) -> usize {
-    let probe = fin_case(negotiated, LEGACY_UPLOAD).await;
-    let stalled = backpressured(&probe.upload, LEGACY_UPLOAD).await;
-    let (sent, received) = probe.buffers;
-    probe.session.close().await;
-    probe.server.abort();
-    probe.upload.task.abort();
-    probe.destination.abort();
-    let consumed = stalled.saturating_sub(sent + received);
-    let size = (consumed + received / 2) / RAW_CHUNK * RAW_CHUNK;
-    eprintln!(
-        "FIN guard calibration negotiated={negotiated} stalled_at={stalled} client_send={sent} server_receive={received} upload={size}"
-    );
-    assert!(
-        received / 2 > sent,
-        "server receive buffer too small to queue the FIN behind the upload"
-    );
-    size
 }
 
 async fn fin_under_backpressure(negotiated: bool) {
     timeout(Duration::from_secs(90), async {
-        let size = fin_upload_size(negotiated).await;
-        let case = fin_case(negotiated, size).await;
-        // The whole upload, WRITE_EOF (negotiated), close_notify and FIN were
-        // handed to the kernel while the destination reads nothing.
-        timeout(Duration::from_secs(30), case.upload.task)
+        let case = fin_case(negotiated).await;
+        // The upload, WRITE_EOF (negotiated), close_notify and FIN were handed
+        // to the kernel behind the parked reader; the destination reads nothing.
+        let size = timeout(Duration::from_secs(30), case.upload)
             .await
-            .expect("client could not queue its upload and FIN")
+            .expect("client could not park the reader and send its FIN")
             .unwrap()
             .expect("client upload and close");
         let closed = Instant::now();
@@ -753,38 +856,67 @@ async fn fin_under_backpressure(negotiated: bool) {
             !case.server.is_finished() && !case.session.is_closed(),
             "a FIN behind backpressured upload settled the session"
         );
-        assert!(!case.destination.is_finished());
+        // Everything the client sent sits in the server's kernel: the FIN is
+        // behind it, and more upload is queued there than a legacy close may
+        // drop, so discarding that remainder fails the bound below.
+        assert_eq!(
+            send_queued(&case.client_socket),
+            0,
+            "upload left in the client"
+        );
+        let behind = receive_queued(&case.server_socket);
+        assert!(
+            behind > LEGACY_LOSS_BOUND,
+            "only {behind} bytes queued behind the parked reader"
+        );
         case.resume.cancel();
         let data = timeout(Duration::from_secs(30), case.destination)
             .await
             .expect("destination did not receive the upload and EOF")
             .unwrap();
+        let expected = upload_bytes(0, size);
         if negotiated {
             assert_eq!(data.len(), size, "destination upload bytes");
-            assert_eq!(sha256(&data), sha256(&vec![b'U'; size]));
+            assert!(data == expected, "destination upload content or order");
         } else {
-            // A legacy session ends at transport EOF and aborts its streams,
-            // so upload still queued in the session when the reader reaches
-            // the FIN is not delivered (unchanged legacy close semantics).
-            // What did arrive is an in-order prefix followed by EOF.
-            assert!(!data.is_empty() && data.len() <= size);
-            assert!(data.iter().all(|&byte| byte == b'U'));
+            // A legacy session ends at transport EOF and aborts its stream, so
+            // upload still in the stream queue or relay when the reader reaches
+            // the FIN is dropped (unchanged legacy close semantics). The rest
+            // arrives in order, followed by EOF.
+            assert!(
+                data.len() + LEGACY_LOSS_BOUND >= size,
+                "legacy close dropped {} of {size} bytes, more than {LEGACY_LOSS_BOUND}",
+                size - data.len().min(size)
+            );
+            assert!(
+                data[..] == expected[..data.len()],
+                "destination upload is not an in-order prefix"
+            );
         }
         let result = timeout(BOUND, case.server)
             .await
             .expect("session did not end after the FIN was reached")
             .unwrap();
         assert!(result.is_ok(), "session ended with {result:?}");
-        timeout(BOUND, async {
-            while case.session.write_eof_resources_for_test() != (0, 8) {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("stream state and handler slots were not released");
-        assert!(case.session.is_closed());
+        if negotiated {
+            timeout(BOUND, async {
+                while case.session.write_eof_resources_for_test() != (0, 8) {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("stream state and handler slots were not released");
+        } else {
+            timeout(BOUND, async {
+                while case.session.legacy_resources_for_test().await != (0, 0) {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("legacy streams and stream tasks were not released");
+        }
         eprintln!(
-            "FIN under backpressure negotiated={negotiated} upload_bytes={size} delivered_bytes={} delivered_sha256={} held_ms={} result=Ok",
+            "FIN under backpressure negotiated={negotiated} upload_bytes={size} queued_behind_reader={behind} delivered_bytes={} delivered_sha256={} held_ms={} result=Ok",
             data.len(),
             sha256(&data),
             closed.elapsed().as_millis()
