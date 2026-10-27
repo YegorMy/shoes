@@ -136,21 +136,30 @@ closure distinctly. Zero-length application writes are not an EOF signal.
   error, so healthy half-close and backpressure are unchanged; no read-ahead,
   queue, deadline or wire traffic is added. This applies to legacy and
   negotiated sessions alike, and a reset discards accepted data still queued
-  in the kernel. Shoes' own TCP and Unix listeners attach the watch
-  automatically: every accepted connection duplicates its socket descriptor
-  while its protocol is set up. An embedder that accepts TCP itself must
-  create `shoes::embedding::TransportWatch::tcp(&tcp)` before TLS termination,
+  in the kernel.
+- Where the watch exists: on Unix only (elsewhere it never fires), and only
+  on Shoes' own TCP and Unix listeners, not the QUIC listener. Every
+  connection they accept duplicates its socket descriptor while its protocol
+  is set up, and each watched AnyTLS session holds that second descriptor for
+  its lifetime. If the duplicate cannot be created (for example when
+  descriptors are exhausted), Shoes' own listener still serves the
+  connection, without a watch, and its AnyTLS session behaves as before.
+- Embedders: one that accepts TCP itself must create
+  `shoes::embedding::TransportWatch::tcp(&tcp)` before TLS termination,
   refuse the connection if that fails, and run
-  `TransportWatch::scope(Some(watch), handler.setup_server_stream(..))`. Do not
-  fall back to running without a watch: a reset is then only seen once the
-  reader reaches it, so a backpressured session hangs again. On Linux the
-  watch fires on `EPOLLERR`, which also reports a non-empty socket error
-  queue: enabling `SO_ZEROCOPY`, `SO_TIMESTAMPING` or `IP_RECVERR` on a
-  watched socket makes healthy sessions settle as failed. A FIN, TLS-level
-  error or
-  truncation queued behind undelivered upload is still only observed when the
-  reader reaches it (or on embedder cancellation): the OS cannot tell it apart
-  from a complete upload followed by close.
+  `TransportWatch::scope(Some(watch), handler.setup_server_stream(..))`. Do
+  not fall back to running without a watch: a reset is then only seen once
+  the reader reaches it, so a backpressured session hangs again.
+- Socket options (Linux): the watch fires on `EPOLLERR`, raised by a pending
+  socket error and by a non-empty socket error queue. Do not enable these on
+  a watched socket. `SO_ZEROCOPY` and `SO_TIMESTAMPING` report on the error
+  queue, so a healthy session settles as failed. `IP_RECVERR` makes an ICMP
+  error that an established TCP socket would otherwise treat as transient set
+  the socket error itself, so a connection that would have recovered fails.
+- Not observed by the watch: a FIN, TLS-level error or truncation queued
+  behind undelivered upload. It is seen only when the reader reaches it (or
+  on embedder cancellation): the OS cannot tell it apart from a complete
+  upload followed by close.
 
 All new queues, acknowledgements, task maps and waiters require explicit finite
 budgets. Preserve backpressure, do not move bounded per-stream data into an unbounded

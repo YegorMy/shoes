@@ -7,9 +7,12 @@
 //! `EV_EOF` with an error, epoll `EPOLLERR`); a peer's FIN is not an error.
 //!
 //! [`TransportWatch`] holds a duplicate of the accepted socket that is never
-//! read or written and is registered for error readiness only. Shoes' own
-//! listeners attach one to every connection while its protocol is set up, and
-//! a session that can be parked (AnyTLS) takes it for its lifetime.
+//! read or written and is registered for error readiness only. On Unix,
+//! Shoes' own TCP and Unix listeners attach one to every connection while its
+//! protocol is set up, and a session that can be parked (AnyTLS) takes it for
+//! its lifetime. They serve a connection without one when the duplicate
+//! cannot be created. The QUIC listener attaches none; on other platforms the
+//! watch never fires.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -37,10 +40,14 @@ tokio::task_local! {
 /// previous behaviour, so a reset while it is backpressured stays unseen and
 /// the session hangs with its streams, handler slots and destination sockets.
 ///
-/// On Linux the watch fires on `EPOLLERR`, which also reports a non-empty
-/// socket error queue. Enabling error-queue socket options on a watched
-/// socket (`SO_ZEROCOPY`, `SO_TIMESTAMPING`, `IP_RECVERR`) therefore makes
-/// healthy sessions settle as failed; do not enable them on such sockets.
+/// On Linux the watch fires on `EPOLLERR`, which is raised by a pending
+/// socket error and also by a non-empty socket error queue. Do not enable
+/// these options on a watched socket:
+/// - `SO_ZEROCOPY` and `SO_TIMESTAMPING` report completions and transmit
+///   timestamps on the error queue, so a healthy session settles as failed;
+/// - `IP_RECVERR` makes an ICMP error that an established TCP socket would
+///   otherwise treat as transient set the socket error itself, so a
+///   connection that would have recovered fails and its session settles.
 #[derive(Debug)]
 pub struct TransportWatch {
     #[cfg(unix)]

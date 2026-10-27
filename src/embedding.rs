@@ -6,14 +6,19 @@
 //! hooks make no hook calls, but Shoes' own listeners are not otherwise
 //! unchanged:
 //!
-//! - Every accepted TCP or Unix connection duplicates its socket descriptor
-//!   (close-on-exec) while its protocol is set up, for a [`TransportWatch`].
-//!   The duplicate is closed after setup unless an AnyTLS session keeps it
-//!   for its lifetime.
-//! - AnyTLS sessions, legacy and negotiated, settle as failed on a transport
-//!   reset or other socket error, even while their reader is parked on a
-//!   backpressured stream. Accepted data still queued in the kernel is then
-//!   discarded, not delivered.
+//! - On Unix, every connection the TCP and Unix listeners accept duplicates
+//!   its socket descriptor (close-on-exec) while its protocol is set up, for
+//!   a [`TransportWatch`]. The duplicate is closed after setup unless an
+//!   AnyTLS session keeps it, so each watched AnyTLS session holds a second
+//!   descriptor for its lifetime. The QUIC listener attaches no watch, and on
+//!   other platforms the watch never fires.
+//! - If the duplicate cannot be created (for example when descriptors are
+//!   exhausted), these listeners still serve the connection, without a watch.
+//!   An AnyTLS session on it then behaves as before the watch existed.
+//! - AnyTLS sessions with a watch, legacy and negotiated, settle as failed on
+//!   a transport reset or other socket error, even while their reader is
+//!   parked on a backpressured stream. Accepted data still queued in the
+//!   kernel is then discarded, not delivered.
 
 use std::fmt::Debug;
 use std::net::SocketAddr;
