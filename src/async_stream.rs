@@ -169,6 +169,13 @@ pub trait AsyncTargetedMessageStream:
     fn is_message_eof(&self) -> bool {
         true
     }
+
+    /// Whether the stream's framing can carry an empty datagram at all,
+    /// whichever direction has ended. The default preserves the legacy
+    /// convention, where a zero-length message means end of stream.
+    fn carries_empty_messages(&self) -> bool {
+        false
+    }
 }
 
 /// Client stream trait connected directly to targets or to proxy servers, where received messages

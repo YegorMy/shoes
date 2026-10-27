@@ -314,6 +314,12 @@ impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {
     fn is_message_eof(&self) -> bool {
         self.is_eof
     }
+
+    /// Records carry their own length, so an empty one is a datagram in
+    /// either direction, also after the client has ended its stream.
+    fn carries_empty_messages(&self) -> bool {
+        true
+    }
 }
 
 pub type UotV1ServerStream<S> = PacketAddrStream<S>;

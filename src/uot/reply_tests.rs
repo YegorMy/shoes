@@ -3,18 +3,21 @@
 //!
 //! - UoT through the SOCKS server, in non-connect (packet-address) and in
 //!   connect mode: empty client datagrams reach the destination, and empty
-//!   destination replies are dropped.
+//!   destination replies are dropped, also after the client half-closes.
+//! - The SOCKS5 UDP relay keeps the zero-length convention: an empty reply
+//!   ends that destination's replies.
 //! - VLESS UDP, another `run_udp_copy` caller, still forwards an empty reply.
 use super::UOT_V2_MAGIC_ADDRESS;
 use super::reply_test_support::{
-    Destination, serve_config, take_uot_records, uot_record, uot_request,
+    Destination, SCRIPTED_REPLIES, serve_config, take_uot_records, uot_record, uot_request,
 };
 use crate::uuid_util::parse_uuid;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 
 const SOCKS: &str = "    type: socks\n    udp_enabled: true\n";
 // A public test identity, not a credential.
@@ -144,6 +147,94 @@ async fn socks_connect_uot_delivers_empty_datagram_and_drops_empty_reply() {
         ],
         "client replies"
     );
+}
+
+#[tokio::test]
+async fn socks_non_connect_uot_drops_empty_reply_after_client_half_close() {
+    let (go, script) = oneshot::channel();
+    let destination = Destination::scripted(script).await;
+    let (server, serving) = serve_config(SOCKS).await;
+    let mut stream = socks_uot(server).await;
+    let mut data = uot_request(false, destination.target);
+    data.extend(uot_record(false, destination.target, b"start"));
+    stream.write_all(&data).await.unwrap();
+    destination.wait_seen(1).await;
+    // TCP FIN: the client sends nothing more but keeps reading replies.
+    stream.shutdown().await.unwrap();
+    // Let the server read the end of the client stream before any reply.
+    sleep(Duration::from_millis(300)).await;
+    go.send(()).unwrap();
+    let mut buffer = Vec::new();
+    let mut replies = Vec::new();
+    collect(&mut stream, false, &mut buffer, &mut replies, 2).await;
+    eprintln!(
+        "SOCKS non-connect UoT after half-close: destination datagram lengths={:?} reply lengths={:?}",
+        destination.seen(),
+        lengths(&replies)
+    );
+    assert_eq!(destination.seen(), vec![5], "destination datagrams");
+    assert_eq!(
+        replies,
+        [b"before-empty".to_vec(), b"after-empty".to_vec()],
+        "client replies after the client half-closed"
+    );
+    serving.abort();
+}
+
+/// SOCKS5 UDP datagram: `[RSV RSV FRAG][ATYP IPv4][addr][port][data]`.
+fn socks5_udp(target: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0, 0, 0, 1];
+    bytes.extend(target.ip().octets());
+    bytes.extend(target.port().to_be_bytes());
+    bytes.extend(payload);
+    bytes
+}
+
+#[tokio::test]
+async fn socks5_udp_relay_empty_reply_still_ends_that_destination() {
+    let (go, script) = oneshot::channel();
+    go.send(()).unwrap();
+    let destination = Destination::scripted(script).await;
+    let (server, serving) = serve_config(SOCKS).await;
+    let mut control = TcpStream::connect(server).await.unwrap();
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0; 2];
+    control.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!((reply[1], reply[3]), (0, 1), "UDP ASSOCIATE refused");
+    let relay = SocketAddr::from((
+        [reply[4], reply[5], reply[6], reply[7]],
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(&socks5_udp(destination.target, b"start"), relay)
+        .await
+        .unwrap();
+    let mut replies = Vec::new();
+    let mut buf = [0; 1024];
+    while let Ok(Ok((n, _))) = timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await
+    {
+        assert!(n >= 10, "SOCKS5 UDP reply header");
+        replies.push(buf[10..n].to_vec());
+    }
+    eprintln!(
+        "SOCKS5 UDP relay: destination datagram lengths={:?} reply lengths={:?}",
+        destination.seen(),
+        lengths(&replies)
+    );
+    assert_eq!(destination.seen(), vec![5], "destination datagrams");
+    // The relay keeps the zero-length convention: the empty reply ends this
+    // destination's replies, so the one after it is never relayed.
+    assert_eq!(replies, [SCRIPTED_REPLIES[0].to_vec()], "client replies");
+    drop(control);
+    serving.abort();
 }
 
 #[tokio::test]

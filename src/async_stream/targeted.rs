@@ -98,10 +98,18 @@ impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream 
     fn is_message_eof(&self) -> bool {
         (**self).is_message_eof()
     }
+
+    fn carries_empty_messages(&self) -> bool {
+        (**self).carries_empty_messages()
+    }
 }
 impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for &mut T {
     fn is_message_eof(&self) -> bool {
         (**self).is_message_eof()
+    }
+
+    fn carries_empty_messages(&self) -> bool {
+        (**self).carries_empty_messages()
     }
 }
 

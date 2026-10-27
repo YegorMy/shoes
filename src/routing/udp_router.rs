@@ -308,6 +308,15 @@ impl ServerStream {
         }
     }
 
+    /// Whether the stream can carry empty datagrams at all, whether or not
+    /// the client has ended. XUDP cannot.
+    fn carries_empty_messages(&self) -> bool {
+        match self {
+            ServerStream::Targeted(stream) => stream.carries_empty_messages(),
+            ServerStream::Session(_) => false,
+        }
+    }
+
     fn supports_ping(&self) -> bool {
         match self {
             ServerStream::Targeted(stream) => stream.supports_ping(),
@@ -801,10 +810,12 @@ impl<'a> UdpRouter<'a> {
                     Poll::Ready(Ok(())) => {
                         let len = read_buf.filled().len();
                         debug!("[UdpRouter] Read {} bytes from session remote", len);
-                        // An empty message keeps meaning end of stream when either
-                        // end uses that convention.
+                        // An empty message keeps meaning end of stream when the
+                        // remote uses that convention, or when the server stream
+                        // does and so cannot carry an empty reply.
                         if len == 0
-                            && (session.remote.is_message_eof() || self.server.is_message_eof())
+                            && (session.remote.is_message_eof()
+                                || !self.server.carries_empty_messages())
                         {
                             session.remote_read_eof = true;
                             if session.should_remove() {
@@ -814,9 +825,10 @@ impl<'a> UdpRouter<'a> {
                         }
                         // Otherwise both ends carry empty datagrams (packet-address
                         // UoT servers): an empty reply is dropped, never forwarded,
-                        // and the session and both directions continue. Stock
-                        // sing-box clients (sing v0.7.0-beta.2) stall after relaying
-                        // one. Empty client datagrams still reach the destination.
+                        // also after the client half-closed, and the session and both
+                        // directions continue. Stock sing-box clients (sing
+                        // v0.7.0-beta.2) stall after relaying one. Empty client
+                        // datagrams still reach the destination.
                         if len == 0 {
                             debug!("[UdpRouter] Dropped an empty reply from session remote");
                             remote_read_progress = true;
@@ -1823,6 +1835,143 @@ mod tests {
         );
         assert!(!routing.is_finished(), "routing ended");
         routing.abort();
+    }
+
+    /// A remote that carries empty datagrams, like a native UDP socket; its
+    /// reads come from a queue the test fills.
+    struct QueuedRemote {
+        replies: Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+    }
+
+    impl AsyncReadMessage for QueuedRemote {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.replies.lock().unwrap().pop_front() {
+                Some(reply) => {
+                    buf.put_slice(&reply);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWriteMessage for QueuedRemote {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for QueuedRemote {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for QueuedRemote {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for QueuedRemote {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for QueuedRemote {
+        fn is_message_eof(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn half_closed_packet_address_client_drops_empty_reply_and_refreshes_expiry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, server_io) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let mut server = ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(
+            Duplex(server_io),
+        )));
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // The client half-closes: the server stream reaches its end.
+        client_write.shutdown().await.unwrap();
+        router.poll_read_server(&mut cx);
+        assert!(router.server_read_eof, "client half-close not seen");
+
+        let target: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from([Vec::new()])));
+        let mut session = RoutingSession::new(
+            1,
+            target,
+            LookupKey::Destination(NetLocation::from_ip_addr(target.ip(), target.port())),
+            Box::new(QueuedRemote {
+                replies: Arc::clone(&replies),
+            }),
+        );
+        let key = router.expiry_queue.insert(0, Duration::from_secs(1));
+        let initial = router.expiry_queue.deadline(&key);
+        session.expiry_key = Some(key);
+        router.sessions.insert(0, session);
+
+        // An empty reply arrives after the half-close.
+        router.expiry_iteration = 1;
+        router.poll_inbound(&mut cx, false);
+        let session = &router.sessions[&0];
+        assert!(
+            !session.remote_read_eof,
+            "the empty reply ended the session's replies"
+        );
+        let refreshed = router
+            .expiry_queue
+            .deadline(session.expiry_key.as_ref().unwrap());
+        assert!(
+            refreshed >= initial + Duration::from_secs(SESSION_TIMEOUT_SECS - 2),
+            "the dropped reply did not refresh the session expiry"
+        );
+
+        // The next reply is still delivered, and nothing was sent for the
+        // empty one.
+        replies.lock().unwrap().push_back(b"after-empty".to_vec());
+        router.expiry_iteration = 2;
+        router.poll_inbound(&mut cx, false);
+        let expected = uot_record(target, b"after-empty");
+        let mut written = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
+            .await
+            .expect("reply after the empty one")
+            .unwrap();
+        assert_eq!(written, expected, "client replies");
+        let mut extra = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client_read.read(&mut extra))
+                .await
+                .is_err(),
+            "no further reply"
+        );
     }
 
     /// A targeted stream that keeps the legacy convention: empty means EOF.

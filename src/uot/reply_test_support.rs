@@ -11,8 +11,12 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+
+/// What a scripted destination sends back: a reply, an empty reply, a reply.
+pub(crate) const SCRIPTED_REPLIES: [&[u8]; 3] = [b"before-empty", b"", b"after-empty"];
 
 /// A real UDP destination that records the length of every datagram it gets.
 pub(crate) struct Destination {
@@ -24,6 +28,16 @@ pub(crate) struct Destination {
 impl Destination {
     /// Echoes every datagram to its sender.
     pub(crate) async fn echo() -> Self {
+        Self::spawn(None).await
+    }
+
+    /// Answers nothing until `go` fires after the first datagram, then sends
+    /// [`SCRIPTED_REPLIES`] to that datagram's sender.
+    pub(crate) async fn scripted(go: oneshot::Receiver<()>) -> Self {
+        Self::spawn(Some(go)).await
+    }
+
+    async fn spawn(script: Option<oneshot::Receiver<()>>) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let SocketAddr::V4(target) = socket.local_addr().unwrap() else {
             unreachable!()
@@ -31,10 +45,19 @@ impl Destination {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let counted = seen.clone();
         let task = tokio::spawn(async move {
+            let mut script = script;
+            let echo = script.is_none();
             let mut buf = vec![0; 65535];
             while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
                 counted.lock().unwrap().push(n);
-                socket.send_to(&buf[..n], peer).await.unwrap();
+                if echo {
+                    socket.send_to(&buf[..n], peer).await.unwrap();
+                } else if let Some(go) = script.take() {
+                    go.await.unwrap();
+                    for reply in SCRIPTED_REPLIES {
+                        socket.send_to(reply, peer).await.unwrap();
+                    }
+                }
             }
         });
         Self { target, seen, task }

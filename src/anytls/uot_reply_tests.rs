@@ -10,7 +10,8 @@
 //! record with length zero.
 //!
 //! Empty client datagrams reach the destination. Empty destination replies are
-//! dropped: stock sing-box (sing v0.7.0-beta.2) stalls after relaying one.
+//! dropped, also after a negotiated client sends WRITE_EOF: stock sing-box
+//! (sing v0.7.0-beta.2) stalls after relaying one.
 use super::anytls_types::{Command, Frame, FrameCodec};
 use super::write_eof_offer_tests::{Io, PASSWORD, client_tls, direct_selector, tls};
 use super::*;
@@ -26,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 
 /// How the AnyTLS session is set up.
 #[derive(Clone, Copy, Debug)]
@@ -108,6 +110,15 @@ impl UotClient {
     async fn send(&mut self, data: Vec<u8>) {
         self.transport
             .write_all(&Frame::with_data(Command::Psh, 1, data.into()).encode())
+            .await
+            .unwrap();
+        self.transport.flush().await.unwrap();
+    }
+
+    /// Ends the client's write side of stream 1 (write-eof/1 only).
+    async fn write_eof(&mut self) {
+        self.transport
+            .write_all(&Frame::control(Command::WriteEof, 1).encode())
             .await
             .unwrap();
         self.transport.flush().await.unwrap();
@@ -231,4 +242,32 @@ async fn connect_uot_delivers_empty_datagram_and_drops_empty_reply() {
             "client replies"
         );
     }
+}
+
+#[tokio::test]
+async fn negotiated_non_connect_uot_drops_empty_reply_after_write_eof() {
+    let (go, script) = oneshot::channel();
+    let destination = Destination::scripted(script).await;
+    let mut client = UotClient::open(Session::Negotiated, false).await;
+    let mut data = uot_request(false, destination.target);
+    data.extend(uot_record(false, destination.target, b"start"));
+    client.send(data).await;
+    destination.wait_seen(1).await;
+    // The client ends its write side and keeps reading replies.
+    client.write_eof().await;
+    // Let the server reach the stream's end before any reply.
+    sleep(Duration::from_millis(300)).await;
+    go.send(()).unwrap();
+    client.collect(2).await;
+    eprintln!(
+        "negotiated non-connect UoT after WRITE_EOF: destination datagram lengths={:?} reply lengths={:?}",
+        destination.seen(),
+        lengths(&client.replies)
+    );
+    assert_eq!(destination.seen(), vec![5], "destination datagrams");
+    assert_eq!(
+        client.replies,
+        [b"before-empty".to_vec(), b"after-empty".to_vec()],
+        "client replies after WRITE_EOF"
+    );
 }

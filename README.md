@@ -68,7 +68,7 @@ or cancellation guarantee for native certificate verification.
 
 UoT servers deliver an empty client datagram to its destination but drop an
 empty destination reply: it is neither forwarded nor treated as end of stream,
-and the next reply is relayed normally.
+also after the client has half-closed, and the next reply is relayed normally.
 Stock sing-box clients (sing v0.7.0-beta.2) stop receiving replies after
 relaying an empty one. This covers both UoT forms:
 
