@@ -43,11 +43,11 @@ impl Resolver for CompositeResolver {
                 match resolver.resolve_location(&location).await {
                     Ok(addrs) if !addrs.is_empty() => {
                         if i > 0 {
+                            // Resolver descriptions name DNS servers, and the
+                            // location is the queried name: index and counts only.
                             log::info!(
-                                "CompositeResolver: resolved {} via resolver #{} ({:?}) after {} failures",
-                                location,
+                                "CompositeResolver: resolved via resolver #{} after {} failures",
                                 i,
-                                resolver,
                                 i
                             );
                         }
@@ -55,20 +55,16 @@ impl Resolver for CompositeResolver {
                     }
                     Ok(_) => {
                         log::debug!(
-                            "CompositeResolver: resolver #{} ({:?}) returned empty for {}, trying next",
-                            i,
-                            resolver,
-                            location
+                            "CompositeResolver: resolver #{} returned empty, trying next",
+                            i
                         );
                         last_error = Some(std::io::Error::other("empty response"));
                     }
                     Err(e) => {
                         log::debug!(
-                            "CompositeResolver: resolver #{} ({:?}) failed for {}: {}, trying next",
+                            "CompositeResolver: resolver #{} failed (kind={:?}), trying next",
                             i,
-                            resolver,
-                            location,
-                            e
+                            e.kind()
                         );
                         last_error = Some(e);
                     }

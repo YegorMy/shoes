@@ -12,6 +12,7 @@ use hickory_resolver::Resolver;
 use hickory_resolver::config::{
     ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
 };
+use hickory_resolver::net::NetError;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
@@ -40,6 +41,35 @@ impl Default for HickoryResolverOptions {
             connect_timeout: Duration::from_secs(5),
             attempts: 2,
         }
+    }
+}
+
+/// A bounded transport label for a resolver description. Descriptions carry
+/// DNS server addresses and names (`udp://addr`, `tls://addr#name`,
+/// `https://name/...`, `pool[...]`), which diagnostics must not show.
+pub(crate) fn resolver_kind(description: &str) -> &'static str {
+    if description.starts_with("pool[") {
+        return "pool";
+    }
+    match description.split_once("://").map(|(scheme, _)| scheme) {
+        Some("udp") => "udp",
+        Some("tcp") => "tcp",
+        Some("tls") => "tls",
+        Some("https") => "https",
+        Some("h3") => "h3",
+        _ => "resolver",
+    }
+}
+
+/// A bounded label for a lookup failure. hickory's Display can carry the
+/// queried name, returned records and server addresses.
+fn failure_kind(e: &NetError) -> &'static str {
+    match e {
+        NetError::Timeout => "timeout",
+        _ if e.is_no_records_found() => "no records",
+        NetError::Io(_) => "io",
+        NetError::NoConnections | NetError::Busy => "unavailable",
+        _ => "other",
     }
 }
 
@@ -247,7 +277,7 @@ impl ShoesResolver for HickoryResolver {
 
         let name = location.address().to_string();
         let port = location.port();
-        let description = self.description.clone();
+        let kind = resolver_kind(&self.description);
         let resolver = self.inner.clone();
 
         Box::pin(async move {
@@ -255,13 +285,12 @@ impl ShoesResolver for HickoryResolver {
 
             let response = resolver.lookup_ip(&name).await.map_err(|e| {
                 let elapsed = started.elapsed();
+                // The queried name, answers and server addresses are private.
                 log::warn!(
-                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
-                    description,
-                    name,
-                    port,
+                    "DNS lookup failed via {} resolver in {:?} ({})",
+                    kind,
                     elapsed,
-                    e
+                    failure_kind(&e)
                 );
                 std::io::Error::other(format!("DNS lookup failed: {e}"))
             })?;
@@ -281,20 +310,16 @@ impl ShoesResolver for HickoryResolver {
             let elapsed = started.elapsed();
             if elapsed > Duration::from_millis(500) {
                 log::info!(
-                    "slow DNS lookup via {}: {}:{} -> {:?} in {:?}",
-                    description,
-                    name,
-                    port,
-                    addrs,
+                    "slow DNS lookup via {} resolver: {} addresses in {:?}",
+                    kind,
+                    addrs.len(),
                     elapsed
                 );
             } else {
                 log::debug!(
-                    "DNS lookup via {}: {}:{} -> {:?} in {:?}",
-                    description,
-                    name,
-                    port,
-                    addrs,
+                    "DNS lookup via {} resolver: {} addresses in {:?}",
+                    kind,
+                    addrs.len(),
                     elapsed
                 );
             }

@@ -199,10 +199,11 @@ impl Resolver for RefreshingResolver {
                             state.generation = state.generation.wrapping_add(1);
                         }
                         Err(e) => {
+                            // Rebuild errors can name DNS servers: log the kind only.
                             log::warn!(
-                                "RefreshingResolver ({}): idle refresh failed: {}",
+                                "RefreshingResolver ({}): idle refresh failed (kind={:?})",
                                 description,
-                                e
+                                e.kind()
                             );
                         }
                     }
@@ -228,10 +229,9 @@ impl Resolver for RefreshingResolver {
                         return Ok(addrs);
                     }
                     log::info!(
-                        "RefreshingResolver ({}): refresh-on-error ({}) for {}",
+                        "RefreshingResolver ({}): refresh-on-error ({})",
                         description,
-                        err.kind(),
-                        location
+                        err.kind()
                     );
                     match factory().await {
                         Ok(fresh) => {
@@ -246,9 +246,9 @@ impl Resolver for RefreshingResolver {
                         }
                         Err(factory_err) => {
                             log::warn!(
-                                "RefreshingResolver ({}): error-refresh factory failed: {}",
+                                "RefreshingResolver ({}): error-refresh factory failed (kind={:?})",
                                 description,
-                                factory_err
+                                factory_err.kind()
                             );
                             Err(err)
                         }
@@ -279,7 +279,11 @@ impl Resolver for NativeResolver {
                     r.filter(|addr| !addr.ip().is_unspecified())
                         .collect::<Vec<_>>()
                 });
-                debug!("NativeResolver resolved {address}:{port} -> {ret:?}");
+                // Queried names and resolved addresses are private: counts only.
+                match &ret {
+                    Ok(addrs) => debug!("NativeResolver resolved {} addresses", addrs.len()),
+                    Err(e) => debug!("NativeResolver lookup failed (kind={:?})", e.kind()),
+                }
                 ret
             }),
         )
@@ -421,7 +425,7 @@ impl Resolver for CachingNativeResolver {
                 },
             );
 
-            debug!("CachingNativeResolver resolved {address}:{port} -> {addrs:?}");
+            debug!("CachingNativeResolver resolved {} addresses", addrs.len());
             Ok(addrs)
         })
     }

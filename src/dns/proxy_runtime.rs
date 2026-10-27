@@ -103,28 +103,20 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             let connect_future = chain_group.connect_tcp(target.into(), &resolver);
             match tokio::time::timeout(timeout, connect_future).await {
                 Ok(Ok(result)) => {
-                    log::debug!(
-                        "DNS upstream connect to {} succeeded in {:?}",
-                        server_addr,
-                        started.elapsed()
-                    );
+                    // DNS server addresses are private: elapsed time and kind only.
+                    log::debug!("DNS upstream connect succeeded in {:?}", started.elapsed());
                     Ok(AsyncIoTokioAsStd(result.client_stream))
                 }
                 Ok(Err(e)) => {
                     log::warn!(
-                        "DNS upstream connect to {} failed in {:?}: {}",
-                        server_addr,
+                        "DNS upstream connect failed in {:?} (kind={:?})",
                         started.elapsed(),
-                        e
+                        e.kind()
                     );
                     Err(e)
                 }
                 Err(_) => {
-                    log::warn!(
-                        "DNS upstream connect to {} timed out in {:?}",
-                        server_addr,
-                        started.elapsed()
-                    );
+                    log::warn!("DNS upstream connect timed out in {:?}", started.elapsed());
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(

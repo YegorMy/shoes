@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
 use crate::dns::composite_resolver::CompositeResolver;
-use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
+use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions, resolver_kind};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
 use crate::option_util::NoneOrSome;
 use crate::resolver::{
@@ -138,10 +138,9 @@ impl HickoryResolverPlan {
                 }
 
                 log::debug!(
-                    "HickoryResolverPlan ({}): resolved {} to {:?}",
-                    self.description,
-                    hostname,
-                    ips
+                    "HickoryResolverPlan ({}): bootstrap resolved {} addresses",
+                    resolver_kind(&self.description),
+                    ips.len()
                 );
                 ips
             }
