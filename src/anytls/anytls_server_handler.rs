@@ -22,6 +22,7 @@ use crate::embedding::{SessionAuth, SessionGrant};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::transport_watch::TransportWatch;
 use crate::util::write_all;
 use aws_lc_rs::digest::{SHA256, digest};
 
@@ -211,6 +212,9 @@ impl AnyTlsServerHandler {
         // Get any remaining unparsed data that may have been buffered
         let initial_data = reader.unparsed_data_owned();
 
+        // Owned by the session from here, so it is released with it.
+        let transport_watch = TransportWatch::take_current();
+
         // Create session with all dependencies for internal stream handling
         let session = AnyTlsSession::new_server_with_initial_data(
             server_stream,
@@ -222,6 +226,7 @@ impl AnyTlsServerHandler {
             initial_data,
         );
         session.enable_write_eof(self.write_eof_enabled);
+        session.watch_transport(transport_watch);
 
         // Run the session in a background task
         tokio::spawn(async move {

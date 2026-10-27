@@ -126,6 +126,23 @@ closure distinctly. Zero-length application writes are not an EOF signal.
 - Full FIN, transport error, reset, explicit full Close, cancellation and session
   shutdown remain full failures/closure and promptly unblock pending operations.
   A dropped/cancelled writer or lost IO acknowledgement is never success.
+- Transport failure while backpressured (Shoes): a session reader parked on a
+  full per-stream queue does not read the transport, and the kernel returns
+  queued bytes before a reset error. The server therefore also watches the
+  accepted socket for OS error readiness (kqueue `EV_EOF` with an error, epoll
+  `EPOLLERR`) through a never-read duplicate of the socket, and settles the
+  whole session on it: handler future error, registry cleared, relay handlers
+  and destination sockets aborted, handler slots returned. A FIN is not an
+  error, so healthy half-close and backpressure are unchanged; no read-ahead,
+  queue, deadline or wire traffic is added. A reset discards accepted data
+  still queued in the kernel. Shoes' own TCP and Unix listeners attach the
+  watch automatically. An embedder that accepts TCP itself must create
+  `shoes::embedding::TransportWatch::tcp(&tcp)` before TLS termination and run
+  `TransportWatch::scope(watch, handler.setup_server_stream(..))`; without it a
+  reset is only seen once the reader reaches it. A FIN, TLS-level error or
+  truncation queued behind undelivered upload is still only observed when the
+  reader reaches it (or on embedder cancellation): the OS cannot tell it apart
+  from a complete upload followed by close.
 
 All new queues, acknowledgements, task maps and waiters require explicit finite
 budgets. Preserve backpressure, do not move bounded per-stream data into an unbounded

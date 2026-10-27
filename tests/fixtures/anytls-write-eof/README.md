@@ -74,6 +74,10 @@ Existing constructors remain legacy. Opt in with
 `open_stream` method. The server handler's `with_write_eof(true)` enables exact
 offer/echo policy. These types and a factory accepting an explicit outbound chain
 and optional existing embedder hooks are exposed under `shoes::embedding`.
+An embedder that accepts TCP itself also passes the accepted socket's
+`TransportWatch` (see the server fixture) so a reset settles a backpressured
+session; unsupported offers (`x-write-eof` other than exactly `1`, or a base
+version other than `v=2`) fail closed on an enabled server.
 
 Strict sessions permit 8 registered streams, 4 incoming frames per stream and 16
 shared outgoing operations, all with payload at most 65,535 bytes. The queue payload

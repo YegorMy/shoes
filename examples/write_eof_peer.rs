@@ -5,7 +5,7 @@ use shoes::client_proxy_chain::ClientChainGroup;
 use shoes::config::{ClientChainHop, ClientConfig, ConfigSelection};
 use shoes::embedding::{
     self, AnyTlsClientSession, OutboundDecision, PaddingFactory, ServerHooks, SessionAuth,
-    SessionGrant, WriteEofClientSession, WriteEofOptions,
+    SessionGrant, TransportWatch, WriteEofClientSession, WriteEofOptions,
 };
 use shoes::resolver::{NativeResolver, Resolver};
 use shoes::tcp::{chain_builder::build_client_proxy_chain, tcp_handler::TcpServerHandler};
@@ -181,14 +181,21 @@ async fn server(a: &[String]) -> io::Result<()> {
         listener.local_addr()?
     );
     let (tcp, _) = listener.accept().await?;
+    // This fixture terminates TCP and TLS itself, so it supplies the socket's
+    // failure signal: a reset settles the session even while it is backpressured.
+    let watch = TransportWatch::tcp(&tcp).ok();
     let tls = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
         .accept(tcp)
         .await?;
-    handler.setup_server_stream(Box::new(TlsIo(tls))).await?;
+    TransportWatch::scope(watch, handler.setup_server_stream(Box::new(TlsIo(tls)))).await?;
+    let started = std::time::Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(50), done.cancelled()).await;
     cancel.cancel();
     result.map_err(|_| failure("fixture session did not settle"))?;
-    println!("session_settled=true");
+    println!(
+        "session_settled=true session_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 

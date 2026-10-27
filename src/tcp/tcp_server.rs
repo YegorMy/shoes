@@ -15,6 +15,7 @@ use crate::embedding::SessionAuth;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+use crate::transport_watch::TransportWatch;
 use crate::util::write_all;
 
 mod listener;
@@ -34,6 +35,20 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
+/// Error readiness of an accepted socket, for sessions whose reader can be
+/// parked on a backpressured stream. Dropped after setup unless one takes it.
+fn transport_watch<AS: 'static>(stream: &AS) -> Option<TransportWatch> {
+    let stream = stream as &dyn std::any::Any;
+    if let Some(tcp) = stream.downcast_ref::<tokio::net::TcpStream>() {
+        return TransportWatch::tcp(tcp).ok();
+    }
+    #[cfg(unix)]
+    if let Some(unix) = stream.downcast_ref::<tokio::net::UnixStream>() {
+        return TransportWatch::unix(unix).ok();
+    }
+    None
+}
+
 pub async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
@@ -42,9 +57,10 @@ pub async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    let watch = transport_watch(&stream);
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
-        setup_server_stream(stream, server_handler),
+        TransportWatch::scope(watch, setup_server_stream(stream, server_handler)),
     );
 
     let setup_result = match setup_server_stream_future.await {

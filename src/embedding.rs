@@ -21,6 +21,8 @@ pub use crate::anytls::{
     AnyTlsClientHandler, AnyTlsClientSession, AnyTlsServerHandler, AnyTlsStream, PaddingFactory,
     WriteEofClientSession, WriteEofError, WriteEofOptions,
 };
+// An embedder that accepts TCP itself supplies the socket's failure signal.
+pub use crate::transport_watch::TransportWatch;
 
 /// Construct an AnyTLS handler on an embedder-owned authenticated TLS transport.
 /// The outbound chain and optional hooks are explicit, just as for existing servers.

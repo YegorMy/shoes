@@ -129,6 +129,7 @@ pub mod tcp;
 mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
+mod transport_watch;
 mod trojan_handler;
 mod tuic_server;
 mod uot;

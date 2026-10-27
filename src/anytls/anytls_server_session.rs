@@ -17,6 +17,7 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_server::run_udp_copy;
+use crate::transport_watch::TransportWatch;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -39,6 +40,10 @@ const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Upper bound on the graceful writer shutdown when a session closes.
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn transport_failure() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionReset, "AnyTLS transport failed")
+}
 
 /// Taking handlers out of the registry must never detach them on cancellation,
 /// writer failure or a drain deadline. The semaphore still bounds these to eight.
@@ -63,6 +68,9 @@ pub struct AnyTlsSession {
     // Wire ids can be reused after registry retirement, before destination
     // shutdown completes. Task identity retains *both* relays without collision.
     write_eof_tasks: Mutex<HashMap<tokio::task::Id, JoinHandle<()>>>,
+    /// Error readiness of the accepted socket. A reader parked on stream
+    /// delivery does not read the transport, so a reset is only seen here.
+    transport_watch: std::sync::Mutex<Option<TransportWatch>>,
     /// Underlying connection (split into reader/writer)
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -152,6 +160,7 @@ impl AnyTlsSession {
             write_eof_rx: Mutex::new(write_eof_rx),
             write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             write_eof_tasks: Mutex::new(HashMap::new()),
+            transport_watch: std::sync::Mutex::new(None),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -210,6 +219,7 @@ impl AnyTlsSession {
             write_eof_rx: Mutex::new(write_eof_rx),
             write_eof_handler_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             write_eof_tasks: Mutex::new(HashMap::new()),
+            transport_watch: std::sync::Mutex::new(None),
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -242,6 +252,12 @@ impl AnyTlsSession {
     /// Set before run; does not change behavior for clients without the exact offer.
     pub(super) fn enable_write_eof(&self, enabled: bool) {
         self.write_eof_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Set before run. Without a watch, a transport failure is only seen once
+    /// the reader reaches it.
+    pub(super) fn watch_transport(&self, watch: Option<TransportWatch>) {
+        *self.transport_watch.lock().unwrap() = watch;
     }
 
     #[cfg(test)]
@@ -305,9 +321,19 @@ impl AnyTlsSession {
         cancel: Option<CancellationToken>,
     ) -> io::Result<()> {
         let session = Arc::clone(self);
+        // Held here, so the duplicate socket closes when the session returns.
+        let watch = session.transport_watch.lock().unwrap().take();
+        let transport_failed = async move {
+            match watch {
+                Some(watch) => watch.failed().await,
+                None => std::future::pending().await,
+            }
+        };
 
         // Run the receive loop. Cancellation is checked first, so a session
-        // cancelled before or while it runs handles no further frames.
+        // cancelled before or while it runs handles no further frames. A
+        // transport failure settles the session even while its reader is
+        // parked on a backpressured stream.
         let receive_and_settle = async {
             session.recv_loop().await?;
             if session.write_eof_agreed.load(Ordering::SeqCst) {
@@ -325,11 +351,13 @@ impl AnyTlsSession {
                         Ok(())
                     }
                 },
+                () = transport_failed => Err(transport_failure()),
                 () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
                 result = session.process_outgoing() => result,
                 result = receive_and_settle => result,
             },
             None => tokio::select! {
+                () = transport_failed => Err(transport_failure()),
                 () = session.write_eof.cancel.cancelled() => Err(protocol_error()),
                 result = session.process_outgoing() => result,
                 result = receive_and_settle => result,

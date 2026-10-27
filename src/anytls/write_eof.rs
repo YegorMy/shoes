@@ -5,6 +5,9 @@
 //! most 65535 bytes. No per-stream forwarding task or unbounded queue exists here.
 //! Each stream has at most one flush acknowledgement and one EOF acknowledgement.
 //! EOF completion acknowledges actual ordered transport write AND flush.
+//! A server session also settles on its accepted socket's error readiness
+//! (`crate::transport_watch`), since a reader parked on a full stream queue
+//! does not read the transport.
 use super::anytls_client_session::AnyTlsClientSession;
 use super::anytls_padding::{CHECK_MARK, PaddingFactory};
 use super::anytls_stream::AnyTlsStream;
