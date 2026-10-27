@@ -608,6 +608,7 @@ pub struct WriteEofClientSession {
     core: Arc<Registry>,
     next_id: AtomicU32,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>, // exactly two, never per-stream
+    #[allow(dead_code)] // Embedding API: used by the library, not by the binary.
     next_padding: Arc<Mutex<Arc<PaddingFactory>>>,
 }
 impl Drop for WriteEofClientSession {
@@ -711,6 +712,7 @@ impl WriteEofClientSession {
         Ok(session)
     }
     /// Current session keeps its original scheme, per AnyTLS update semantics.
+    #[allow(dead_code)] // Embedding API: used by the library, not by the binary.
     pub fn padding_for_next_session(&self) -> Arc<PaddingFactory> {
         self.next_padding.lock().clone()
     }
@@ -757,6 +759,7 @@ impl WriteEofClientSession {
         Ok(AnyTlsStream::from_write_eof(stream))
     }
     /// Explicit full session cancellation. Pending operations cannot succeed.
+    #[allow(dead_code)] // Embedding API: used by the library, not by the binary.
     pub async fn close(&self) -> io::Result<()> {
         self.core.close();
         let mut tasks = std::mem::take(&mut *self.tasks.lock());

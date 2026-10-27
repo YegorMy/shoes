@@ -57,6 +57,7 @@ impl AnyTlsClientHandler {
     }
 
     /// Require explicit write-eof/1 agreement; never downgrade to legacy FIN.
+    #[allow(dead_code)] // Embedding API: used by the library, not by the binary.
     pub fn require_write_eof(mut self, options: super::WriteEofOptions) -> Self {
         self.write_eof = Some(options);
         self
