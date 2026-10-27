@@ -18,7 +18,9 @@ use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::transport_watch::TransportWatch;
-use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
+use crate::uot::{
+    UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2ConnectStream,
+};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
@@ -1154,9 +1156,10 @@ impl AnyTlsSession {
                     stream_id
                 );
 
-                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
+                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for
+                // length-prefixed), dropping empty replies toward the client.
                 let server_stream: Box<dyn AsyncMessageStream> =
-                    Box::new(VlessMessageStream::new(stream));
+                    Box::new(UotV2ConnectStream::new(VlessMessageStream::new(stream)));
 
                 // Connect through the proxy chain
                 let client_stream = match chain_group

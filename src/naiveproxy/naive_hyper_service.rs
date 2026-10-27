@@ -28,7 +28,9 @@ use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_handler::TcpServerSetupResult;
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::tls_server_handler::NaiveConfig;
-use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
+use crate::uot::{
+    UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2ConnectStream, UotV2Stream,
+};
 
 use tokio::io::AsyncReadExt;
 
@@ -490,7 +492,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                             .await?;
 
                         return run_udp_copy(
-                            Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
+                            Box::new(UotV2ConnectStream::new(uot_v2_stream))
+                                as Box<dyn AsyncMessageStream>,
                             client_stream,
                             false,
                             false,

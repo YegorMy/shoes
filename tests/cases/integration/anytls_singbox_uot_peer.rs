@@ -1,12 +1,13 @@
 //! Pinned stock sing-box v1.12.0 client relaying an empty UDP datagram over
 //! UoT v2 to the Shoes AnyTLS server. sing-box terminates the client's UoT
-//! stream and re-dials Shoes in non-connect mode, which is the path tested.
+//! stream and re-dials Shoes in non-connect (packet-address) mode, or in
+//! connect mode when a `udp_connect` route option is set; both are tested.
 //!
 //! The pinned client cannot relay an empty reply: sing v0.7.0-beta.2
 //! `common/bufio/vectorised_unix.go` never consumes the zero-length payload
 //! iovec, so its writer spins and later replies never leave it (reproduced
 //! without Shoes, with sing-box as both client and server). Shoes therefore
-//! drops empty destination replies on packet-address UoT paths: the empty
+//! drops empty destination replies on UoT paths in both modes: the empty
 //! datagram still reaches the destination, and the reply after it reaches the
 //! SOCKS client.
 
@@ -84,8 +85,9 @@ async fn uot_exchange(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result
     exact(stream, usize::from(len)).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
+/// Runs the exchange through sing-box and Shoes and returns the datagram
+/// lengths the destination saw and the replies the SOCKS client received.
+async fn singbox_uot_exchange(udp_connect: bool) -> (Vec<usize>, Vec<Vec<u8>>) {
     let version = Command::new("docker")
         .args(["run", "--rm", PEER, "version"])
         .output()
@@ -143,7 +145,7 @@ async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
         }
     });
 
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "log": {"level": "error"},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "0.0.0.0", "listen_port": 1080}],
         "outbounds": [{
@@ -153,6 +155,12 @@ async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
                     "certificate": [identity.cert.pem()]}
         }]
     });
+    if udp_connect {
+        // sing-box then re-dials Shoes with a connect-mode UoT request.
+        config["route"] = serde_json::json!({
+            "rules": [{"inbound": "in", "action": "route-options", "udp_connect": true}]
+        });
+    }
     let config_path = dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mount = format!("{}:/etc/sing-box/config.json:ro", config_path.display());
@@ -235,18 +243,35 @@ async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
     .await;
     let seen = seen.lock().unwrap().clone();
     eprintln!(
-        "sing-box UoT destination datagram lengths={seen:?} reply lengths={:?}",
+        "sing-box UoT udp_connect={udp_connect} destination datagram lengths={seen:?} reply lengths={:?}",
         replies.iter().map(Vec::len).collect::<Vec<_>>()
-    );
-    assert_eq!(seen, vec![12, 0, 11], "destination datagrams");
-    assert_eq!(
-        replies,
-        [b"before-empty".to_vec(), b"after-empty".to_vec()],
-        "client replies"
     );
     drop(peer);
     echo_task.abort();
     for server in servers {
         server.abort();
     }
+    (seen, replies)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
+    let (seen, replies) = singbox_uot_exchange(false).await;
+    assert_eq!(seen, vec![12, 0, 11], "destination datagrams");
+    assert_eq!(
+        replies,
+        [b"before-empty".to_vec(), b"after-empty".to_vec()],
+        "client replies"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn container_singbox_connect_mode_uot_relays_empty_datagram_to_anytls() {
+    let (seen, replies) = singbox_uot_exchange(true).await;
+    assert_eq!(seen, vec![12, 0, 11], "destination datagrams");
+    assert_eq!(
+        replies,
+        [b"before-empty".to_vec(), b"after-empty".to_vec()],
+        "client replies"
+    );
 }

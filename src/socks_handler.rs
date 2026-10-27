@@ -16,7 +16,9 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
+use crate::uot::{
+    UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2ConnectStream, UotV2Stream,
+};
 use crate::util::write_all;
 
 pub const VER_SOCKS5: u8 = 0x05;
@@ -328,7 +330,7 @@ pub async fn setup_socks_server_stream_inner(
 
                 return Ok(TcpServerSetupResult::BidirectionalUdp {
                     remote_location: destination,
-                    stream: Box::new(uot_v2_stream),
+                    stream: Box::new(UotV2ConnectStream::new(uot_v2_stream)),
                     need_initial_flush: false,
                     proxy_selector: proxy_selector.clone(),
                 });

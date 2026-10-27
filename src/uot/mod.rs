@@ -24,6 +24,14 @@
 //! - Multi-destination mode (same as V1)
 //! - Subsequent packets: `[AddrParser address][length:u16be][data]`
 //!
+//! ### Empty datagrams (server side, every mode)
+//! - A zero-length client packet is an empty datagram and reaches the
+//!   destination.
+//! - A zero-length destination reply is dropped, not written to the client,
+//!   and is not end of stream: stock sing-box clients (sing v0.7.0-beta.2)
+//!   stop relaying replies after one. Connect mode does this through
+//!   [`UotV2ConnectStream`], the other modes in the UDP router.
+//!
 //! ## Address Formats (IMPORTANT!)
 //!
 //! Two different address formats are used:
@@ -41,11 +49,15 @@
 mod socks_addr;
 pub mod uot_common;
 mod uot_v1_server_stream;
+mod uot_v2_connect_stream;
 
 #[cfg(test)]
-mod non_connect_reply_tests;
+pub(crate) mod reply_test_support;
+#[cfg(test)]
+mod reply_tests;
 
 pub use uot_v1_server_stream::{SocksPacketAddrStream, UotV1ServerStream};
+pub use uot_v2_connect_stream::UotV2ConnectStream;
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
 pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;
