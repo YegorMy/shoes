@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 members = ["tests/support"]
-exclude = ["vendor/rustls"]
+exclude = ["vendor/rustls", "vendor/rustls-platform-verifier"]
 resolver = "3"
 
 [lib]
@@ -149,3 +149,4 @@ strip = true
 
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
+rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }

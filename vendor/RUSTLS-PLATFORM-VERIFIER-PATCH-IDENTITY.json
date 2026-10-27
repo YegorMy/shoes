@@ -1,0 +1,37 @@
+{
+  "package": "rustls-platform-verifier",
+  "version": "0.7.0",
+  "sourceVcs": {
+    "git": {
+      "sha1": "996b1c903491641b17b3c9afb65d1352f6fc6b76"
+    },
+    "path_in_vcs": "rustls-platform-verifier"
+  },
+  "changed": [
+    {
+      "path": "src/verification/android.rs",
+      "original": "e4056a6916f67e4e611ab5473c7e072f91420d6bf7137ce6e65f1cf0bf03e592",
+      "patched": "15976727607652e4885dfa040803982e04d623f118fddcda07b13dfc919fc027"
+    },
+    {
+      "path": "src/verification/apple.rs",
+      "original": "9fe3b62eb8a5615ca2c2bbdf512e83907c87c771212d5bb2c3c671af6a8c6875",
+      "patched": "90ed6a66b27d0b35a53089ab61ffb9f309c8fed0577e62607da677acd3a4f872"
+    },
+    {
+      "path": "src/verification/mod.rs",
+      "original": "7bca5f8cc5b80164b52a8290d250f32e5c5e470459d137eec850555efe9a215e",
+      "patched": "8e3de9940f70b7965ad9ccbcb85788d9728190fce8cf1ed541be078a2cbd0303"
+    },
+    {
+      "path": "src/verification/others.rs",
+      "original": "a6531a1b725607af1b20ab1a33446e61c1135b508c3b361963d62a53bb436a44",
+      "patched": "01cf2408074963d9a358b28481e1f14128bdedbfe927ca68b02d78ef84b92202"
+    },
+    {
+      "path": "src/verification/windows.rs",
+      "original": "6f861a61ccd4624d50ebd055bc316414499f8611d5eb0794978e0cac8554bc78",
+      "patched": "20f2019ca72cb545f7e47e056796ea68b6156ee64ac56938e07bc1e05a9f4b62"
+    }
+  ]
+}
