@@ -222,23 +222,21 @@ impl RealityClientConnection {
         // SessionId is at offset 39 in ClientHello handshake
         client_hello[39..71].fill(0);
 
+        // Keys, nonces, SessionId contents and handshake bytes never enter
+        // diagnostics: lengths and progress only.
         log::debug!("REALITY CLIENT: Encrypting SessionId");
-        log::debug!("  auth_key={:02x?}", auth_key);
-        log::debug!("  nonce={:02x?}", nonce);
-        log::debug!("  plaintext={:02x?}", session_id_plaintext);
         log::debug!(
             "  aad_len={} (ClientHello with zero SessionId)",
             client_hello.len()
         );
-        log::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
         let encrypted_session_id =
             encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         log::debug!(
-            "REALITY CLIENT: Encrypted SessionId={:02x?}",
-            encrypted_session_id
+            "REALITY CLIENT: SessionId encrypted ({} bytes)",
+            encrypted_session_id.len()
         );
 
         // Restore the encrypted SessionId before writing or storing ClientHello.
@@ -371,9 +369,8 @@ impl RealityClientConnection {
         let server_hello = &record[TLS_RECORD_HEADER_SIZE..]; // Skip TLS record header (includes handshake header)
 
         log::debug!(
-            "REALITY CLIENT: ServerHello for transcript: len={}, bytes={:02x?}",
-            server_hello.len(),
-            server_hello
+            "REALITY CLIENT: ServerHello for transcript: len={}",
+            server_hello.len()
         );
 
         let server_public_key = extract_server_public_key(&record)?;
@@ -395,14 +392,12 @@ impl RealityClientConnection {
         // Compute transcript hash using negotiated cipher suite's algorithm
         let mut full_transcript = digest::Context::new(cipher_suite.digest_algorithm());
         log::debug!(
-            "REALITY CLIENT: Transcript includes ClientHello ({} bytes), first bytes: {:02x?}",
-            client_hello_bytes.len(),
-            &client_hello_bytes[..client_hello_bytes.len().min(20)]
+            "REALITY CLIENT: Transcript includes ClientHello ({} bytes)",
+            client_hello_bytes.len()
         );
         log::debug!(
-            "REALITY CLIENT: Transcript includes ServerHello ({} bytes), first bytes: {:02x?}",
-            server_hello.len(),
-            &server_hello[..server_hello.len().min(20)]
+            "REALITY CLIENT: Transcript includes ServerHello ({} bytes)",
+            server_hello.len()
         );
         full_transcript.update(&client_hello_bytes); // Use actual ClientHello bytes, not hash!
         full_transcript.update(server_hello); // ServerHello already includes handshake header
@@ -492,11 +487,7 @@ impl RealityClientConnection {
             derive_traffic_keys(server_handshake_traffic_secret, *cipher_suite)?;
 
         if *handshake_seq == 0 {
-            log::debug!(
-                "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
-                &server_hs_key[..16],
-                server_hs_iv
-            );
+            log::debug!("REALITY CLIENT: Server handshake key and iv derived");
         }
 
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
@@ -722,8 +713,8 @@ impl RealityClientConnection {
         let handshake_hash_vec: Vec<u8> = handshake_hash.as_ref().to_vec();
 
         log::debug!(
-            "REALITY CLIENT: Handshake hash for client Finished: {:02x?}",
-            handshake_hash_vec
+            "REALITY CLIENT: Handshake hash for client Finished computed ({} bytes)",
+            handshake_hash_vec.len()
         );
         log::debug!(
             "REALITY CLIENT: Transcript bytes len={}, accumulated_plaintext len={}",
@@ -734,8 +725,8 @@ impl RealityClientConnection {
         let client_verify_data =
             compute_finished_verify_data(cipher_suite, &client_hs_secret, &handshake_hash_vec)?;
         log::debug!(
-            "REALITY CLIENT: Client verify data: {:02x?}",
-            client_verify_data
+            "REALITY CLIENT: Client verify data computed ({} bytes)",
+            client_verify_data.len()
         );
         let client_finished = construct_finished(&client_verify_data)?;
 
@@ -979,7 +970,10 @@ impl RealityClientConnection {
                 log::debug!("REALITY CLIENT: Encrypted close_notify alert queued");
             }
             Err(e) => {
-                log::error!("REALITY CLIENT: Failed to encrypt close_notify: {}", e);
+                log::error!(
+                    "REALITY CLIENT: Failed to encrypt close_notify (kind={:?})",
+                    e.kind()
+                );
             }
         }
     }

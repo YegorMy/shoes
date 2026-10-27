@@ -84,9 +84,10 @@ pub async fn setup_reality_server_stream(
         "unexpected early_data from dest connection"
     );
 
+    // The dest and auth errors (which carry SessionId contents) are private:
+    // log outcomes, sizes and kinds only.
     log::debug!(
-        "REALITY: Connected to dest {}, forwarding ClientHello ({} bytes)",
-        target.dest,
+        "REALITY: Connected to dest, forwarding ClientHello ({} bytes)",
         client_hello_frame.len()
     );
 
@@ -136,7 +137,7 @@ pub async fn setup_reality_server_stream(
                 match deframer.next_records() {
                     Ok(records) => records,
                     Err(e) => {
-                        log::error!("REALITY: Error parsing dest records: {}", e);
+                        log::error!("REALITY: Error parsing dest records (kind={:?})", e.kind());
                         break;
                     }
                 }
@@ -159,8 +160,7 @@ pub async fn setup_reality_server_stream(
                 Ok(parsed) => {
                     if !parsed.is_tls13 {
                         log::error!(
-                            "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
-                            target.dest
+                            "REALITY: Dest is TLS 1.2, falling back to transparent forward"
                         );
                         start_forward_to_dest(
                             server_stream,
@@ -179,7 +179,10 @@ pub async fn setup_reality_server_stream(
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
-                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
+                    log::error!(
+                        "REALITY: Failed to parse dest ServerHello (kind={:?})",
+                        e.kind()
+                    );
                     start_forward_to_dest(
                         server_stream,
                         dest_stream,
@@ -247,8 +250,8 @@ pub async fn setup_reality_server_stream(
     match auth_result {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             log::warn!(
-                "REALITY: Auth failed ({}), forwarding to dest transparently",
-                e
+                "REALITY: Auth failed (kind={:?}), forwarding to dest transparently",
+                e.kind()
             );
             start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
 
@@ -261,7 +264,10 @@ pub async fn setup_reality_server_stream(
         }
 
         Err(e) => {
-            log::error!("REALITY: Unexpected error during auth: {}", e);
+            log::error!(
+                "REALITY: Unexpected error during auth (kind={:?})",
+                e.kind()
+            );
             return Err(e);
         }
 
@@ -318,12 +324,18 @@ fn start_forward_to_dest(
     tokio::spawn(async move {
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
-                log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
+                log::debug!(
+                    "REALITY FALLBACK: Error forwarding record (kind={:?})",
+                    e.kind()
+                );
                 let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
                 return;
             }
             if let Err(e) = client_stream.flush().await {
-                log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
+                log::debug!(
+                    "REALITY FALLBACK: Error flushing record (kind={:?})",
+                    e.kind()
+                );
                 let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
                 return;
             }
@@ -332,7 +344,10 @@ fn start_forward_to_dest(
         if !remaining_data.is_empty()
             && let Err(e) = write_all(&mut client_stream, &remaining_data).await
         {
-            log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
+            log::debug!(
+                "REALITY FALLBACK: Error forwarding remaining data (kind={:?})",
+                e.kind()
+            );
             let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
             return;
         }
@@ -354,7 +369,10 @@ fn start_forward_to_dest(
         let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
 
         if let Err(e) = result {
-            log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
+            log::debug!(
+                "REALITY FALLBACK: Connection ended with error (kind={:?})",
+                e.kind()
+            );
         }
     });
 }

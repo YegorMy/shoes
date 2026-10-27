@@ -54,11 +54,9 @@ pub fn hkdf_expand(
         ctx.update(&[i as u8]);
         let tag = ctx.sign();
 
-        log::debug!(
-            "HKDF iteration {}: output={:02x?}",
-            i,
-            &tag.as_ref()[..tag.as_ref().len().min(16)]
-        );
+        // Derived keys, secrets and transcript hashes never enter diagnostics:
+        // lengths and progress only.
+        log::debug!("HKDF iteration {}: output len={}", i, tag.as_ref().len());
 
         prev = tag.as_ref().to_vec();
         output.extend_from_slice(tag.as_ref());
@@ -104,7 +102,7 @@ fn hkdf_expand_label_with_algorithm(
     hkdf_label.push(context.len() as u8);
     hkdf_label.extend_from_slice(context);
 
-    log::debug!("HKDF_LABEL_BYTES: {:02x?}", hkdf_label);
+    log::debug!("HKDF_LABEL_BYTES: {} bytes", hkdf_label.len());
 
     hkdf_expand(hmac_algorithm, secret, &hkdf_label, length)
 }
@@ -155,7 +153,10 @@ pub fn derive_traffic_keys(
         iv_length,
         hash_len
     );
-    log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
+    log::debug!(
+        "TRAFFIC_KEY_DERIVE: traffic_secret len={}",
+        traffic_secret.len()
+    );
 
     // key = HKDF-Expand-Label(Secret, "key", "", key_length)
     let key =
@@ -165,8 +166,11 @@ pub fn derive_traffic_keys(
     let iv =
         hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
 
-    log::debug!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    log::debug!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
+    log::debug!(
+        "TRAFFIC_KEY_DERIVE: derived key ({} bytes) and iv ({} bytes)",
+        key.len(),
+        iv.len()
+    );
 
     Ok((key, iv))
 }
@@ -270,7 +274,7 @@ pub fn derive_handshake_keys(
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
     let master_secret = hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
-    log::debug!("  master_secret: {:?}", &master_secret[..8]);
+    log::debug!("  master_secret derived ({} bytes)", master_secret.len());
 
     Ok(Tls13HandshakeKeys {
         client_handshake_traffic_secret,
@@ -314,8 +318,8 @@ pub fn derive_application_secrets(
         cipher_suite
     );
     log::debug!(
-        "  handshake_hash (with Finished): {:?}",
-        &handshake_hash[..8]
+        "  handshake_hash (with Finished): {} bytes",
+        handshake_hash.len()
     );
 
     // Client Application Traffic Secret
@@ -327,12 +331,8 @@ pub fn derive_application_secrets(
     )?;
 
     log::debug!(
-        "  client_app_traffic: {:?}",
-        &client_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ClientAppSecret(full)={:02x?}",
-        client_application_traffic_secret
+        "  client_app_traffic derived ({} bytes)",
+        client_application_traffic_secret.len()
     );
 
     // Server Application Traffic Secret
@@ -344,12 +344,8 @@ pub fn derive_application_secrets(
     )?;
 
     log::debug!(
-        "  server_app_traffic: {:?}",
-        &server_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ServerAppSecret(full)={:02x?}",
-        server_application_traffic_secret
+        "  server_app_traffic derived ({} bytes)",
+        server_application_traffic_secret.len()
     );
 
     Ok((

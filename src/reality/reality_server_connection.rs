@@ -313,10 +313,9 @@ impl RealityServerConnection {
         let session_id = extract_session_id_slice(client_hello)?;
         let client_public_key = extract_client_public_key(client_hello)?;
 
-        log::debug!(
-            "REALITY: ClientHello received, client_random: {:?}",
-            &client_random[..8]
-        );
+        // Client random, SessionId contents (version, timestamp, short_id) and
+        // handshake bytes never enter diagnostics: outcomes and lengths only.
+        log::debug!("REALITY: ClientHello received");
 
         // Perform ECDH to derive auth key
         let shared_secret = perform_ecdh(&self.config.private_key, &client_public_key)
@@ -368,9 +367,7 @@ impl RealityServerConnection {
         ]) as u64;
         let client_short_id = &decrypted_session_id[8..16];
 
-        log::debug!("REALITY: Client version: {:?}", client_version);
-        log::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        log::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
+        log::debug!("REALITY: SessionId decrypted");
 
         // Validate short ID using constant-time comparison
         let mut client_short_id_arr = [0u8; 8];
@@ -380,10 +377,7 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
+            log::warn!("REALITY: Client short_id not in configured list");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("Invalid short_id: {:02x?}", client_short_id),
@@ -402,9 +396,7 @@ impl RealityServerConnection {
 
             if time_diff_secs > max_diff_secs {
                 log::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
+                    "REALITY: Client timestamp differs from server by {} seconds (max: {} seconds)",
                     time_diff_secs,
                     max_diff_secs
                 );
@@ -422,11 +414,7 @@ impl RealityServerConnection {
         if let Some(min_ver) = &self.config.min_client_version
             && client_version < &min_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is below minimum {:?}",
-                client_version,
-                min_ver
-            );
+            log::warn!("REALITY: Client version is below the configured minimum");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -440,11 +428,7 @@ impl RealityServerConnection {
         if let Some(max_ver) = &self.config.max_client_version
             && client_version > &max_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is above maximum {:?}",
-                client_version,
-                max_ver
-            );
+            log::warn!("REALITY: Client version is above the configured maximum");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -454,12 +438,7 @@ impl RealityServerConnection {
             ));
         }
 
-        log::debug!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
-            client_version,
-            client_timestamp
-        );
+        log::debug!("REALITY: Client authentication successful");
 
         // Negotiate cipher suite with client
         let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
@@ -1084,7 +1063,10 @@ impl RealityServerConnection {
                 log::debug!("REALITY: Encrypted close_notify alert queued");
             }
             Err(e) => {
-                log::error!("REALITY: Failed to encrypt close_notify: {}", e);
+                log::error!(
+                    "REALITY: Failed to encrypt close_notify (kind={:?})",
+                    e.kind()
+                );
             }
         }
     }

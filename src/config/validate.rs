@@ -782,10 +782,10 @@ fn validate_reality_server_short_ids(
     };
 
     if is_default {
+        // The target name is a configured server name: not logged.
         log::warn!(
-            "Reality server '{}' using default short_ids (all zeros). \
-             For better security in production, configure explicit short_ids.",
-            target_name
+            "Reality server using default short_ids (all zeros). \
+             For better security in production, configure explicit short_ids."
         );
     }
 
