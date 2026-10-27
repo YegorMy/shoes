@@ -214,13 +214,16 @@ fn upload(stream: AnyTlsStream, size: usize) -> Upload<ReadHalf<AnyTlsStream>> {
     }
 }
 
-/// Legacy wire client. Shoes' own legacy client queues writes without bound
+/// Raw v2 wire client. Shoes' own legacy client queues writes without bound
 /// (`AnyTlsClientSession` uses an unbounded channel), so it never stalls; this
-/// writes ordinary v2 frames straight to TLS and stalls with the transport.
-async fn raw_legacy_upload(
+/// writes frames straight to TLS and stalls with the transport. A negotiated
+/// client offers write-eof/1 and ends its stream with WRITE_EOF. Either ends
+/// the upload with TLS close_notify and TCP FIN.
+async fn raw_upload(
     mut transport: Box<dyn AsyncStream>,
     target: SocketAddr,
     size: usize,
+    negotiated: bool,
 ) -> Upload<ReadHalf<Box<dyn AsyncStream>>> {
     let mut password = [0; 32];
     password.copy_from_slice(
@@ -237,8 +240,13 @@ async fn raw_legacy_upload(
     let progress = Arc::new(AtomicUsize::new(0));
     let accepted = progress.clone();
     let task = tokio::spawn(async move {
+        let settings: &'static [u8] = if negotiated {
+            b"v=2\nx-write-eof=1"
+        } else {
+            b"v=2"
+        };
         let mut head = BytesMut::new();
-        Frame::with_data(Command::Settings, 0, Bytes::from_static(b"v=2")).encode_into(&mut head);
+        Frame::with_data(Command::Settings, 0, Bytes::from_static(settings)).encode_into(&mut head);
         Frame::control(Command::Syn, 1).encode_into(&mut head);
         Frame::with_data(
             Command::Psh,
@@ -253,6 +261,11 @@ async fn raw_legacy_upload(
             writer.flush().await?;
             accepted.fetch_add(RAW_CHUNK, SeqCst);
         }
+        if negotiated {
+            writer
+                .write_all(&Frame::control(Command::WriteEof, 1).encode())
+                .await?;
+        }
         writer.shutdown().await
     });
     Upload {
@@ -260,6 +273,14 @@ async fn raw_legacy_upload(
         task,
         reader,
     }
+}
+
+async fn raw_legacy_upload(
+    transport: Box<dyn AsyncStream>,
+    target: SocketAddr,
+    size: usize,
+) -> Upload<ReadHalf<Box<dyn AsyncStream>>> {
+    raw_upload(transport, target, size, false).await
 }
 
 /// Wait until the upload stops making progress: the session is backpressured.
@@ -590,4 +611,195 @@ async fn legacy_backpressured_reset_settles_through_shoes_config() {
     })
     .await
     .unwrap();
+}
+
+// A peer FIN is not a transport failure. These guards hold the session's
+// reader parked on a full stream queue (the destination does not read) while
+// the client's close_notify and FIN wait in the server's kernel receive queue
+// behind the undelivered upload, for longer than the 5 s bound. A watch that
+// fired on read-closed readiness would settle these sessions as failed and
+// lose data. Once the destination reads again, the session reaches the FIN
+// and ends cleanly.
+
+/// Requested server receive buffer: the FIN must fit behind the queued upload.
+const FIN_RECEIVE_BUFFER: u32 = 1024 * 1024;
+const FIN_RESPONSE: usize = 4 * 1024;
+
+/// A destination that first sends a response and its write EOF (a negotiated
+/// session settles gracefully only once both directions ended), then reads
+/// nothing until `resume`, then reads to EOF.
+fn held_destination(respond: bool) -> (SocketAddr, CancellationToken, JoinHandle<Vec<u8>>) {
+    let listener = small_listener();
+    let addr = listener.local_addr().unwrap();
+    let resume = CancellationToken::new();
+    let resumed = resume.clone();
+    let task = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        if respond {
+            tcp.write_all(&vec![b'R'; FIN_RESPONSE]).await.unwrap();
+            tcp.shutdown().await.unwrap();
+        }
+        resumed.cancelled().await;
+        let mut data = Vec::new();
+        tcp.read_to_end(&mut data).await.unwrap();
+        data
+    });
+    (addr, resume, task)
+}
+
+struct FinCase {
+    session: Arc<AnyTlsSession>,
+    server: JoinHandle<io::Result<()>>,
+    upload: Upload<ReadHalf<Box<dyn AsyncStream>>>,
+    resume: CancellationToken,
+    destination: JoinHandle<Vec<u8>>,
+    // Effective client send and server receive buffer sizes.
+    buffers: (usize, usize),
+}
+
+/// A hand-built session behind Shoes' transport watch, uploading `size` bytes
+/// to a held destination over a small client socket and a large server one.
+async fn fin_case(negotiated: bool, size: usize) -> FinCase {
+    let tls = tls();
+    let socket = small_socket();
+    socket.set_recv_buffer_size(FIN_RECEIVE_BUFFER).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tls.acceptor.clone();
+    let (created, created_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let received = socket2::SockRef::from(&tcp).recv_buffer_size().unwrap();
+        let watch = watch(&tcp);
+        let mut transport = acceptor.accept(tcp).await.unwrap();
+        let mut hash = [0; 32];
+        transport.read_exact(&mut hash).await.unwrap();
+        let len = transport.read_u16().await.unwrap();
+        transport
+            .read_exact(&mut vec![0; len as usize])
+            .await
+            .unwrap();
+        let session = AnyTlsSession::new_server_with_initial_data(
+            Io(transport),
+            PaddingFactory::default_factory(),
+            Arc::new(NativeResolver),
+            direct_selector(),
+            false,
+            "public-test".into(),
+            None,
+        );
+        session.enable_write_eof(negotiated);
+        attach(&session, watch);
+        created
+            .send((session.clone(), received))
+            .unwrap_or_else(|_| panic!("test receiver closed"));
+        session.run_until_cancelled(None).await
+    });
+    let (target, resume, destination) = held_destination(negotiated);
+    let client = small_socket();
+    let sent = client.send_buffer_size().unwrap() as usize;
+    let transport = client_tls(&tls, client.connect(addr).await.unwrap()).await;
+    let upload = raw_upload(transport, target, size, negotiated).await;
+    let (session, received) = created_rx.await.unwrap();
+    FinCase {
+        session,
+        server,
+        upload,
+        resume,
+        destination,
+        buffers: (sent, received),
+    }
+}
+
+/// Upload size that parks the reader with room left for the FIN: what the
+/// server consumes before parking plus half of its receive buffer. Measured
+/// on this host with an otherwise identical session (kernel send buffers on
+/// the destination path are autotuned and differ between hosts).
+async fn fin_upload_size(negotiated: bool) -> usize {
+    let probe = fin_case(negotiated, LEGACY_UPLOAD).await;
+    let stalled = backpressured(&probe.upload, LEGACY_UPLOAD).await;
+    let (sent, received) = probe.buffers;
+    probe.session.close().await;
+    probe.server.abort();
+    probe.upload.task.abort();
+    probe.destination.abort();
+    let consumed = stalled.saturating_sub(sent + received);
+    let size = (consumed + received / 2) / RAW_CHUNK * RAW_CHUNK;
+    eprintln!(
+        "FIN guard calibration negotiated={negotiated} stalled_at={stalled} client_send={sent} server_receive={received} upload={size}"
+    );
+    assert!(
+        received / 2 > sent,
+        "server receive buffer too small to queue the FIN behind the upload"
+    );
+    size
+}
+
+async fn fin_under_backpressure(negotiated: bool) {
+    timeout(Duration::from_secs(90), async {
+        let size = fin_upload_size(negotiated).await;
+        let case = fin_case(negotiated, size).await;
+        // The whole upload, WRITE_EOF (negotiated), close_notify and FIN were
+        // handed to the kernel while the destination reads nothing.
+        timeout(Duration::from_secs(30), case.upload.task)
+            .await
+            .expect("client could not queue its upload and FIN")
+            .unwrap()
+            .expect("client upload and close");
+        let closed = Instant::now();
+        sleep(BOUND + Duration::from_secs(1)).await;
+        assert!(
+            !case.server.is_finished() && !case.session.is_closed(),
+            "a FIN behind backpressured upload settled the session"
+        );
+        assert!(!case.destination.is_finished());
+        case.resume.cancel();
+        let data = timeout(Duration::from_secs(30), case.destination)
+            .await
+            .expect("destination did not receive the upload and EOF")
+            .unwrap();
+        if negotiated {
+            assert_eq!(data.len(), size, "destination upload bytes");
+            assert_eq!(sha256(&data), sha256(&vec![b'U'; size]));
+        } else {
+            // A legacy session ends at transport EOF and aborts its streams,
+            // so upload still queued in the session when the reader reaches
+            // the FIN is not delivered (unchanged legacy close semantics).
+            // What did arrive is an in-order prefix followed by EOF.
+            assert!(!data.is_empty() && data.len() <= size);
+            assert!(data.iter().all(|&byte| byte == b'U'));
+        }
+        let result = timeout(BOUND, case.server)
+            .await
+            .expect("session did not end after the FIN was reached")
+            .unwrap();
+        assert!(result.is_ok(), "session ended with {result:?}");
+        timeout(BOUND, async {
+            while case.session.write_eof_resources_for_test() != (0, 8) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stream state and handler slots were not released");
+        assert!(case.session.is_closed());
+        eprintln!(
+            "FIN under backpressure negotiated={negotiated} upload_bytes={size} delivered_bytes={} delivered_sha256={} held_ms={} result=Ok",
+            data.len(),
+            sha256(&data),
+            closed.elapsed().as_millis()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressured_negotiated_fin_is_not_a_transport_failure() {
+    fin_under_backpressure(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressured_legacy_fin_is_not_a_transport_failure() {
+    fin_under_backpressure(false).await;
 }
