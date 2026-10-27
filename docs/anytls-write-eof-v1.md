@@ -55,6 +55,15 @@ as a healthy live-traffic/write/flush deadline. Reject duplicate feature keys,
 invalid UTF-8 or conflicting negotiation; do not use last-value-wins to manufacture
 agreement. An unknown extension version is not automatically compatible.
 
+Shoes server rule: on an enabled server, a Settings offer that carries the
+`x-write-eof` key with any value other than exactly `1` (for example `2`, `0`,
+empty, `01`, `1 `), or carries it on a base version other than exactly `v=2`
+(absent, `1`, `3`), is a negotiation failure. The server sends nothing in reply
+(no ServerSettings, no padding update), handles no SYN or PSH queued behind the
+offer, and closes the session with the sanitized negotiation error. An absent key
+(keys are case-sensitive) keeps the legacy session. A server without the explicit
+enable policy keeps stock behaviour and ignores the key.
+
 Strict callers receive a typed/sanitized unsupported/negotiation/timeout error if
 agreement is unavailable. Do not downgrade the requirement, send full FIN as a
 substitute, omit EOF, inject an application terminator or fall back to direct IO.

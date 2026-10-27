@@ -22,4 +22,6 @@ pub use anytls_stream::AnyTlsStream;
 pub use write_eof::{WriteEofClientSession, WriteEofError, WriteEofOptions};
 
 #[cfg(test)]
+mod write_eof_offer_tests;
+#[cfg(test)]
 mod write_eof_tests;

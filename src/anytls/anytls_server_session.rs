@@ -4,7 +4,7 @@
 //! handling framing, multiplexing, padding, and stream routing.
 
 use super::write_eof::{
-    FEATURE, MAX_STREAMS, Operation, Registry, WriteEofOptions, protocol_error,
+    FEATURE, MAX_STREAMS, Operation, Registry, WriteEofOptions, negotiation_error, protocol_error,
 };
 use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
@@ -669,6 +669,15 @@ impl AnyTlsSession {
                 } else {
                     StringMap::from_bytes(&frame.data)
                 };
+                // An offer is exactly write-eof/1 on base v2. Any other value or
+                // base version fails before any reply, never as a legacy session.
+                if enabled
+                    && settings.get(FEATURE).is_some()
+                    && (settings.get(FEATURE).map(String::as_str) != Some("1")
+                        || settings.get("v").map(String::as_str) != Some("2"))
+                {
+                    return Err(negotiation_error());
+                }
                 self.received_client_settings.store(true, Ordering::Relaxed);
 
                 // Check padding-md5
@@ -1239,14 +1248,27 @@ mod tests {
                 if let Some(offer) = offer {
                     settings.insert(FEATURE, offer);
                 }
-                session
+                let result = session
                     .handle_frame(Frame::with_data(
                         Command::Settings,
                         0,
                         Bytes::from(settings.to_bytes()),
                     ))
-                    .await
-                    .unwrap();
+                    .await;
+                if enabled && matches!(offer, Some("0") | Some("2")) {
+                    // Unsupported versions fail negotiation before any reply.
+                    assert!(result.is_err());
+                    assert!(!session.write_eof_agreed.load(Ordering::SeqCst));
+                    assert!(
+                        timeout(Duration::from_millis(50), peer.read(&mut [0; 1]))
+                            .await
+                            .is_err(),
+                        "no settings reply"
+                    );
+                    session.close().await;
+                    continue;
+                }
+                result.unwrap();
                 let mut wire = [0; 256];
                 let count = peer.read(&mut wire).await.unwrap();
                 let frame = FrameCodec::decode(&mut BytesMut::from(&wire[..count]))
