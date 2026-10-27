@@ -3,6 +3,8 @@
 //! treated as server output. Raw records and both process channels are retained.
 #[path = "tls_client.rs"]
 mod client;
+#[path = "tls_engine.rs"]
+mod engine;
 #[path = "tls_guard.rs"]
 mod guard;
 #[path = "tls_trace.rs"]
@@ -42,6 +44,7 @@ const CHILD: &str = "SHOES_TLS_PRIVACY_CHILD";
 tokio::task_local! { static FIXTURE_CLIENT: (); }
 static TERMINALS: AtomicUsize = AtomicUsize::new(0);
 static FALLBACK_TERMINALS: AtomicUsize = AtomicUsize::new(0);
+static QUIC_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 struct Writer {
     file: FileLogWriter,
@@ -68,6 +71,9 @@ impl LogWriter for Writer {
         trace::bridge(record);
         if record.target() == "shoes::tcp::tcp_server::listener" {
             TERMINALS.fetch_add(1, Ordering::SeqCst);
+        }
+        if record.target() == "shoes::quic_server" && record.level() == log::Level::Error {
+            QUIC_FAILURES.fetch_add(1, Ordering::SeqCst);
         }
         if record.target() == "shoes::shadow_tls::shadow_tls_server_handler"
             && record.args().to_string() == "SHADOWTLS FALLBACK: Connection completed"

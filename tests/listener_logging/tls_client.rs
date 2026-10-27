@@ -66,7 +66,7 @@ fn ss_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(SS_KEY_BYTES)
 }
 
-fn pin(der: &[u8]) -> String {
+pub(super) fn pin(der: &[u8]) -> String {
     aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der)
         .as_ref()
         .iter()
@@ -74,7 +74,7 @@ fn pin(der: &[u8]) -> String {
         .collect()
 }
 
-fn block(pem: &str, indent: usize) -> String {
+pub(super) fn block(pem: &str, indent: usize) -> String {
     pem.lines()
         .map(|line| format!("{:indent$}{line}\n", ""))
         .collect()
@@ -102,7 +102,7 @@ impl Fixture {
 }
 
 #[derive(Debug)]
-struct MapResolver(BTreeMap<String, SocketAddr>);
+pub(super) struct MapResolver(pub(super) BTreeMap<String, SocketAddr>);
 
 impl Resolver for MapResolver {
     fn resolve_location(
@@ -366,7 +366,7 @@ fn fixture(dir: &Path) {
 }
 
 /// Every rendering of protected bytes that a diagnostic could plausibly emit.
-fn protect(policy: &mut Policy, bytes: &[u8]) {
+pub(super) fn protect(policy: &mut Policy, bytes: &[u8]) {
     policy.protect(bytes);
     let debug = format!("{bytes:?}");
     policy
@@ -390,7 +390,7 @@ fn protect(policy: &mut Policy, bytes: &[u8]) {
     }
 }
 
-fn protect_certificate(policy: &mut Policy, der: &[u8]) {
+pub(super) fn protect_certificate(policy: &mut Policy, der: &[u8]) {
     protect(policy, der);
     let certificate = CertificateDer::from(der.to_vec());
     policy.protected.push(format!("{certificate:?}"));
@@ -416,7 +416,7 @@ fn fixture_material(path: &Path) -> Fixture {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn pem_certificate(der: &[u8]) -> String {
+pub(super) fn pem_certificate(der: &[u8]) -> String {
     let body = base64::engine::general_purpose::STANDARD.encode(der);
     let lines: Vec<_> = body
         .as_bytes()
@@ -892,15 +892,15 @@ fn client(dir: &Path, level: &str) {
 }
 
 #[derive(Debug)]
-struct Violation {
-    channel: &'static str,
-    record: String,
-    reason: String,
-    detail: String,
+pub(super) struct Violation {
+    pub(super) channel: &'static str,
+    pub(super) record: String,
+    pub(super) reason: String,
+    pub(super) detail: String,
 }
 
 impl Violation {
-    fn new(channel: &'static str, record: &str, reason: &str, detail: &str) -> Self {
+    pub(super) fn new(channel: &'static str, record: &str, reason: &str, detail: &str) -> Self {
         Self {
             channel,
             record: record.to_owned(),
@@ -1130,7 +1130,7 @@ fn inspect(dir: &Path, stdout: &[u8], stderr: &[u8], level: &str) -> Vec<Violati
     violations
 }
 
-fn summary(violations: &[Violation]) -> String {
+pub(super) fn summary(violations: &[Violation]) -> String {
     // Channel, record and reason only: details may hold protected values and
     // are kept in the capture directory instead.
     violations
@@ -1139,7 +1139,7 @@ fn summary(violations: &[Violation]) -> String {
         .collect()
 }
 
-struct FixtureProcess(Child);
+pub(super) struct FixtureProcess(pub(super) Child);
 
 impl Drop for FixtureProcess {
     fn drop(&mut self) {
