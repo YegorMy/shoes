@@ -79,7 +79,11 @@ relaying an empty one. This covers both UoT forms:
   bidirectional relay above still carries empty client datagrams but the
   client-facing UoT stream drops a zero-length reply.
 
-Other UDP paths keep their behaviour: the SOCKS5 UDP relay, Snell and
+An empty reply is dropped only when it comes from a remote that carries empty
+datagrams: a native or unconnected UDP socket, or a chained VLESS UDP, AnyTLS
+UoT or Shadowsocks UoT outbound. From a remote that keeps the zero-length
+convention (for example VMess, Snell or h2mux) it still ends that remote's
+replies. Other UDP paths keep their behaviour: the SOCKS5 UDP relay, Snell and
 XUDP still end on an empty reply, and VLESS and VMess UDP, h2mux
 fixed-destination UDP, Hysteria2 and TUIC still forward one.
 
