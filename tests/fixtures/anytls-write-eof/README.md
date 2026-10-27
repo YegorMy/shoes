@@ -76,7 +76,8 @@ offer/echo policy. These types and a factory accepting an explicit outbound chai
 and optional existing embedder hooks are exposed under `shoes::embedding`.
 An embedder that accepts TCP itself also passes the accepted socket's
 `TransportWatch` (see the server fixture) so a reset settles a backpressured
-session; unsupported offers (`x-write-eof` other than exactly `1`, or a base
+session, and refuses the connection when the watch cannot be created: a
+silent fallback to no watch brings back the hang. Unsupported offers (`x-write-eof` other than exactly `1`, or a base
 version other than `v=2`) fail closed on an enabled server.
 
 Strict sessions permit 8 registered streams, 4 incoming frames per stream and 16

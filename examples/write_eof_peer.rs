@@ -183,11 +183,17 @@ async fn server(a: &[String]) -> io::Result<()> {
     let (tcp, _) = listener.accept().await?;
     // This fixture terminates TCP and TLS itself, so it supplies the socket's
     // failure signal: a reset settles the session even while it is backpressured.
-    let watch = TransportWatch::tcp(&tcp).ok();
+    // Without a watch the connection is refused, never served: a session without
+    // one would hang on a reset while backpressured.
+    let watch = TransportWatch::tcp(&tcp)?;
     let tls = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
         .accept(tcp)
         .await?;
-    TransportWatch::scope(watch, handler.setup_server_stream(Box::new(TlsIo(tls)))).await?;
+    TransportWatch::scope(
+        Some(watch),
+        handler.setup_server_stream(Box::new(TlsIo(tls))),
+    )
+    .await?;
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(50), done.cancelled()).await;
     cancel.cancel();

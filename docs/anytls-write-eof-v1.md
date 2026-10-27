@@ -134,12 +134,20 @@ closure distinctly. Zero-length application writes are not an EOF signal.
   whole session on it: handler future error, registry cleared, relay handlers
   and destination sockets aborted, handler slots returned. A FIN is not an
   error, so healthy half-close and backpressure are unchanged; no read-ahead,
-  queue, deadline or wire traffic is added. A reset discards accepted data
-  still queued in the kernel. Shoes' own TCP and Unix listeners attach the
-  watch automatically. An embedder that accepts TCP itself must create
-  `shoes::embedding::TransportWatch::tcp(&tcp)` before TLS termination and run
-  `TransportWatch::scope(watch, handler.setup_server_stream(..))`; without it a
-  reset is only seen once the reader reaches it. A FIN, TLS-level error or
+  queue, deadline or wire traffic is added. This applies to legacy and
+  negotiated sessions alike, and a reset discards accepted data still queued
+  in the kernel. Shoes' own TCP and Unix listeners attach the watch
+  automatically: every accepted connection duplicates its socket descriptor
+  while its protocol is set up. An embedder that accepts TCP itself must
+  create `shoes::embedding::TransportWatch::tcp(&tcp)` before TLS termination,
+  refuse the connection if that fails, and run
+  `TransportWatch::scope(Some(watch), handler.setup_server_stream(..))`. Do not
+  fall back to running without a watch: a reset is then only seen once the
+  reader reaches it, so a backpressured session hangs again. On Linux the
+  watch fires on `EPOLLERR`, which also reports a non-empty socket error
+  queue: enabling `SO_ZEROCOPY`, `SO_TIMESTAMPING` or `IP_RECVERR` on a
+  watched socket makes healthy sessions settle as failed. A FIN, TLS-level
+  error or
   truncation queued behind undelivered upload is still only observed when the
   reader reaches it (or on embedder cancellation): the OS cannot tell it apart
   from a complete upload followed by close.

@@ -26,12 +26,21 @@ tokio::task_local! {
 /// handler's setup inside [`TransportWatch::scope`]:
 ///
 /// ```ignore
-/// let watch = TransportWatch::tcp(&tcp).ok();
+/// // No watch, no session: refuse (drop) the connection.
+/// let watch = TransportWatch::tcp(&tcp)?;
 /// let tls = acceptor.accept(tcp).await?;
-/// TransportWatch::scope(watch, handler.setup_server_stream(Box::new(stream))).await
+/// TransportWatch::scope(Some(watch), handler.setup_server_stream(Box::new(stream))).await
 /// ```
 ///
-/// Without a watch, a session keeps its previous behaviour.
+/// Do not fall back to `None` when the watch cannot be created (for example
+/// when descriptors are exhausted): a session without a watch keeps its
+/// previous behaviour, so a reset while it is backpressured stays unseen and
+/// the session hangs with its streams, handler slots and destination sockets.
+///
+/// On Linux the watch fires on `EPOLLERR`, which also reports a non-empty
+/// socket error queue. Enabling error-queue socket options on a watched
+/// socket (`SO_ZEROCOPY`, `SO_TIMESTAMPING`, `IP_RECVERR`) therefore makes
+/// healthy sessions settle as failed; do not enable them on such sockets.
 #[derive(Debug)]
 pub struct TransportWatch {
     #[cfg(unix)]

@@ -3,7 +3,17 @@
 //! An embedding application that manages its own users (adding and revoking
 //! them at runtime) and its own outbound policy installs a [`ServerHooks`]
 //! implementation with [`start_servers_with_hooks`]. Servers started without
-//! hooks behave exactly as before.
+//! hooks make no hook calls, but Shoes' own listeners are not otherwise
+//! unchanged:
+//!
+//! - Every accepted TCP or Unix connection duplicates its socket descriptor
+//!   (close-on-exec) while its protocol is set up, for a [`TransportWatch`].
+//!   The duplicate is closed after setup unless an AnyTLS session keeps it
+//!   for its lifetime.
+//! - AnyTLS sessions, legacy and negotiated, settle as failed on a transport
+//!   reset or other socket error, even while their reader is parked on a
+//!   backpressured stream. Accepted data still queued in the kernel is then
+//!   discarded, not delivered.
 
 use std::fmt::Debug;
 use std::net::SocketAddr;
