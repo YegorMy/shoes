@@ -24,9 +24,20 @@ to Rustls, and completes real certificate and Finished verification before
 inner protocol setup. No separate preflight TLS connection or new ALPN mode is used.
 
 Cargo ignores patches declared only by dependencies. An embedding workspace
-must patch crates-io rustls to this exact maintained Git revision and
-package subdirectory, alongside the same Shoes pin. Keep the selected Rustls
-version and lockfile graph; do not adopt a mutable path in a shipped consumer.
+must patch crates-io rustls to this exact maintained Git revision, alongside
+the same Shoes pin. Cargo finds a package in a Git patch by its name, not by
+a subdirectory, so the consumer's root `Cargo.toml` carries exactly these
+two lines, with `<rev>` the same Shoes commit it pins (the second line is
+described below):
+
+```toml
+[patch.crates-io]
+rustls = { git = "https://github.com/YegorMy/shoes", rev = "<rev>" }
+rustls-platform-verifier = { git = "https://github.com/YegorMy/shoes", rev = "<rev>" }
+```
+
+Keep the selected Rustls version and lockfile graph; do not adopt a mutable
+path in a shipped consumer.
 
 # rustls-platform-verifier source provenance
 
@@ -47,6 +58,7 @@ returned to rustls and the dependency graph are unchanged. The optional
 Shoes; consumers must not enable it.
 
 Cargo ignores patches declared only by dependencies. An embedding workspace
-must patch crates-io rustls-platform-verifier to this exact Git revision and
-package subdirectory, next to the rustls patch; without it the registry
-verifier, with its unbounded error text, is silently used.
+must patch crates-io rustls-platform-verifier to this exact Git revision with
+the `rustls-platform-verifier` line shown above, next to the rustls line;
+without it the registry verifier, with its unbounded error text, is silently
+used.
