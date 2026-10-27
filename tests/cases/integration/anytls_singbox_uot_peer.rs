@@ -2,12 +2,13 @@
 //! UoT v2 to the Shoes AnyTLS server. sing-box terminates the client's UoT
 //! stream and re-dials Shoes in non-connect mode, which is the path tested.
 //!
-//! The pinned client cannot return a datagram that follows an empty reply:
-//! sing v0.7.0-beta.2 `common/bufio/vectorised_unix.go` never consumes the
-//! zero-length payload iovec of the empty reply, so its writer spins and later
-//! replies to the SOCKS client never leave it (reproduced without Shoes, with
-//! sing-box as both client and server). The datagram after the empty one is
-//! therefore checked at the destination, not as a reply.
+//! The pinned client cannot relay an empty reply: sing v0.7.0-beta.2
+//! `common/bufio/vectorised_unix.go` never consumes the zero-length payload
+//! iovec, so its writer spins and later replies never leave it (reproduced
+//! without Shoes, with sing-box as both client and server). Shoes therefore
+//! drops empty destination replies on packet-address UoT paths: the empty
+//! datagram still reaches the destination, and the reply after it reaches the
+//! SOCKS client.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Command;
@@ -200,9 +201,20 @@ async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
             Err(error) => panic!("sing-box SOCKS inbound unavailable: {error}"),
         }
     };
-    let exchanged: [&[u8]; 2] = [b"before-empty", b""];
+    let payloads: [&[u8]; 3] = [b"before-empty", b"", b"after-empty"];
     let mut replies = Vec::new();
-    for payload in exchanged {
+    for (index, payload) in payloads.into_iter().enumerate() {
+        if payload.is_empty() {
+            // No reply is expected: wait until the destination has the datagram.
+            uot_send(&mut stream, payload).await.unwrap();
+            let _ = tokio::time::timeout(LIMIT, async {
+                while seen.lock().unwrap().len() <= index {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            continue;
+        }
         match tokio::time::timeout(LIMIT, uot_exchange(&mut stream, payload)).await {
             Ok(Ok(reply)) => replies.push(reply),
             other => {
@@ -214,23 +226,24 @@ async fn container_singbox_uot_relays_empty_datagram_to_anytls() {
             }
         }
     }
-    // The datagram after the empty one must still reach the destination.
-    if replies.len() == exchanged.len() {
-        uot_send(&mut stream, b"after-empty").await.unwrap();
-        let _ = tokio::time::timeout(LIMIT, async {
-            while seen.lock().unwrap().len() < 3 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-    }
+    // Every datagram must reach the destination, whatever the replies were.
+    let _ = tokio::time::timeout(LIMIT, async {
+        while seen.lock().unwrap().len() < payloads.len() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     let seen = seen.lock().unwrap().clone();
     eprintln!(
         "sing-box UoT destination datagram lengths={seen:?} reply lengths={:?}",
         replies.iter().map(Vec::len).collect::<Vec<_>>()
     );
     assert_eq!(seen, vec![12, 0, 11], "destination datagrams");
-    assert_eq!(replies, exchanged.map(<[u8]>::to_vec), "client replies");
+    assert_eq!(
+        replies,
+        [b"before-empty".to_vec(), b"after-empty".to_vec()],
+        "client replies"
+    );
     drop(peer);
     echo_task.abort();
     for server in servers {

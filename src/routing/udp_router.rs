@@ -801,8 +801,8 @@ impl<'a> UdpRouter<'a> {
                     Poll::Ready(Ok(())) => {
                         let len = read_buf.filled().len();
                         debug!("[UdpRouter] Read {} bytes from session remote", len);
-                        // An empty datagram is forwarded only when both ends carry
-                        // empty messages; otherwise it keeps meaning end of stream.
+                        // An empty message keeps meaning end of stream when either
+                        // end uses that convention.
                         if len == 0
                             && (session.remote.is_message_eof() || self.server.is_message_eof())
                         {
@@ -811,6 +811,17 @@ impl<'a> UdpRouter<'a> {
                                 self.sessions_to_remove.insert(id);
                             }
                             break; // Stop bursting this session
+                        }
+                        // Otherwise both ends carry empty datagrams (packet-address
+                        // UoT servers): an empty reply is dropped, never forwarded,
+                        // and the session and both directions continue. Stock
+                        // sing-box clients (sing v0.7.0-beta.2) stall after relaying
+                        // one. Empty client datagrams still reach the destination.
+                        if len == 0 {
+                            debug!("[UdpRouter] Dropped an empty reply from session remote");
+                            remote_read_progress = true;
+                            session.reset_expiry(&mut self.expiry_queue, id, self.expiry_iteration);
+                            continue;
                         }
 
                         remote_read_progress = true;
@@ -1737,7 +1748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_packet_address_datagram_is_relayed_both_ways() {
+    async fn empty_packet_address_datagram_is_delivered_and_empty_reply_dropped() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = echo.local_addr().unwrap();
@@ -1760,13 +1771,24 @@ mod tests {
             Arc::new(NativeResolver::new()),
             false,
         ));
-        let payloads: [&[u8]; 3] = [b"before-empty", b"", b"after-empty"];
+        let payloads: [&[u8]; 4] = [b"before-empty", b"", b"after-empty", b"still-alive"];
         let mut replies = Vec::new();
-        for payload in payloads {
+        for (index, payload) in payloads.into_iter().enumerate() {
             client
                 .write_all(&uot_record(target, payload))
                 .await
                 .unwrap();
+            if payload.is_empty() {
+                // No reply is expected; wait until the destination has it.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while seen.lock().unwrap().len() <= index {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                continue;
+            }
             let reply = tokio::time::timeout(Duration::from_secs(2), async {
                 let mut header = [0; 9];
                 client.read_exact(&mut header).await.unwrap();
@@ -1782,10 +1804,24 @@ mod tests {
         }
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![12, 0, 11],
+            vec![12, 0, 11, 11],
             "destination datagrams"
         );
-        assert_eq!(replies, payloads.map(<[u8]>::to_vec), "client replies");
+        // Every reply read is the next non-empty one: the empty reply was never
+        // forwarded, did not end the session, and nothing else is pending.
+        assert_eq!(
+            replies,
+            [&b"before-empty"[..], b"after-empty", b"still-alive"].map(<[u8]>::to_vec),
+            "client replies"
+        );
+        let mut extra = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.read(&mut extra))
+                .await
+                .is_err(),
+            "no further reply"
+        );
+        assert!(!routing.is_finished(), "routing ended");
         routing.abort();
     }
 

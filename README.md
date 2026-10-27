@@ -66,6 +66,14 @@ parks before accepting the packet, and treats them as activity. Partial-frame
 EOF remains an IO error. The method does not change framing or provide a timeout
 or cancellation guarantee for native certificate verification.
 
+Packet-address UDP servers (UoT v1 and UoT v2 non-connect mode on the SOCKS,
+Shadowsocks, NaiveProxy and AnyTLS servers, and h2mux packet-address streams)
+deliver an empty client datagram to its destination, but drop an empty
+destination reply: it is neither forwarded nor treated as end of stream, and
+the next reply is relayed normally. Stock sing-box clients (sing
+v0.7.0-beta.2) stop receiving replies after relaying an empty one. The SOCKS5
+UDP relay, Snell, XUDP and connect-mode UoT keep their behaviour.
+
 ## Installation
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).

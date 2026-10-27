@@ -5,6 +5,9 @@
 //! `isConnect = 0`: one PSH carries the request and first record, and every
 //! later datagram is one PSH of `[family 0x00][IPv4][port][u16 length][payload]`.
 //! An empty datagram is therefore a 9-byte record with length zero.
+//!
+//! Empty client datagrams reach the destination. Empty destination replies are
+//! dropped: stock sing-box (sing v0.7.0-beta.2) stalls after relaying one.
 use super::anytls_types::{Command, Frame, FrameCodec};
 use super::write_eof_offer_tests::{Io, PASSWORD, client_tls, direct_selector, tls};
 use super::*;
@@ -106,7 +109,7 @@ async fn replay(enabled: bool, payloads: &[&[u8]]) -> (Vec<usize>, Vec<Vec<u8>>)
     transport.flush().await.unwrap();
     let mut received = BytesMut::new();
     let mut stream_bytes = Vec::new();
-    let mut all_replies = Vec::new();
+    let mut replies = Vec::new();
     for (index, payload) in payloads.iter().enumerate() {
         let mut data = Vec::new();
         if index == 0 {
@@ -122,10 +125,15 @@ async fn replay(enabled: bool, payloads: &[&[u8]]) -> (Vec<usize>, Vec<Vec<u8>>)
             .unwrap();
         transport.flush().await.unwrap();
         // One datagram in flight at a time, as the downstream exchange does.
-        let mut replies = Vec::new();
+        // An empty datagram has no reply to wait for: wait for its delivery.
+        let delivered = index + 1;
+        let expected = replies.len() + usize::from(!payload.is_empty());
         let _ = timeout(Duration::from_secs(2), async {
-            while replies.is_empty() {
-                if transport.read_buf(&mut received).await.unwrap() == 0 {
+            while seen.lock().unwrap().len() < delivered || replies.len() < expected {
+                let read = timeout(Duration::from_millis(20), transport.read_buf(&mut received));
+                if let Ok(read) = read.await
+                    && read.unwrap() == 0
+                {
                     return;
                 }
                 while let Some(frame) = FrameCodec::decode(&mut received).unwrap() {
@@ -137,14 +145,25 @@ async fn replay(enabled: bool, payloads: &[&[u8]]) -> (Vec<usize>, Vec<Vec<u8>>)
             }
         })
         .await;
-        all_replies.extend(replies);
     }
+    // A late empty reply would arrive here.
+    let _ = timeout(Duration::from_millis(300), async {
+        while transport.read_buf(&mut received).await.unwrap() > 0 {
+            while let Some(frame) = FrameCodec::decode(&mut received).unwrap() {
+                if frame.cmd == Command::Psh && frame.stream_id == 1 {
+                    stream_bytes.extend_from_slice(&frame.data);
+                }
+            }
+            take_records(&mut stream_bytes, &mut replies);
+        }
+    })
+    .await;
     let seen = seen.lock().unwrap().clone();
-    (seen, all_replies)
+    (seen, replies)
 }
 
 #[tokio::test]
-async fn stock_non_connect_uot_delivers_empty_datagram() {
+async fn stock_non_connect_uot_delivers_empty_datagram_and_drops_empty_reply() {
     for enabled in [false, true] {
         let payloads: [&[u8]; 3] = [b"before-empty", b"", b"after-empty"];
         let (seen, replies) = replay(enabled, &payloads).await;
@@ -153,12 +172,17 @@ async fn stock_non_connect_uot_delivers_empty_datagram() {
             replies.iter().map(Vec::len).collect::<Vec<_>>()
         );
         assert_eq!(seen, vec![12, 0, 11], "destination datagrams");
-        assert_eq!(replies, payloads.map(<[u8]>::to_vec), "client replies");
+        // The empty reply is dropped; the session and the reply after it live on.
+        assert_eq!(
+            replies,
+            [b"before-empty".to_vec(), b"after-empty".to_vec()],
+            "client replies"
+        );
     }
 }
 
 #[tokio::test]
-async fn stock_non_connect_uot_delivers_empty_first_datagram() {
+async fn stock_non_connect_uot_delivers_empty_first_datagram_and_drops_its_reply() {
     let payloads: [&[u8]; 2] = [b"", b"after-empty"];
     let (seen, replies) = replay(false, &payloads).await;
     eprintln!(
@@ -166,5 +190,5 @@ async fn stock_non_connect_uot_delivers_empty_first_datagram() {
         replies.iter().map(Vec::len).collect::<Vec<_>>()
     );
     assert_eq!(seen, vec![0, 11], "destination datagrams");
-    assert_eq!(replies, payloads.map(<[u8]>::to_vec), "client replies");
+    assert_eq!(replies, [b"after-empty".to_vec()], "client replies");
 }

@@ -42,6 +42,9 @@ mod socks_addr;
 pub mod uot_common;
 mod uot_v1_server_stream;
 
+#[cfg(test)]
+mod non_connect_reply_tests;
+
 pub use uot_v1_server_stream::{SocksPacketAddrStream, UotV1ServerStream};
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
