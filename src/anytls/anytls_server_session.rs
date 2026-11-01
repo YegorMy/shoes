@@ -4,7 +4,7 @@
 //! handling framing, multiplexing, padding, and stream routing.
 
 use super::write_eof::{
-    FEATURE, MAX_STREAMS, Operation, Registry, WriteEofOptions, negotiation_error, protocol_error,
+    FEATURE, MAX_STREAMS, Operation, Registry, negotiation_error, protocol_error,
 };
 use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
@@ -42,6 +42,10 @@ const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Upper bound on the graceful writer shutdown when a session closes.
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a server stream's EOF may take. Below the 5 s write-eof/1 settlement
+/// bound, so that a failed EOF and the release of what it holds both fit inside it.
+const SERVER_EOF_TIMEOUT: Duration = Duration::from_millis(4500);
 
 /// How long one frame may hold the reader before the transport is probed.
 const STUCK_BEFORE_PROBING: Duration = Duration::from_secs(1);
@@ -154,7 +158,7 @@ impl AnyTlsSession {
         // Use bounded channel for outgoing data to provide backpressure
         // Buffer size is per-session, shared across all streams
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
-        let (write_eof, write_eof_rx) = Registry::new(WriteEofOptions::default().eof_timeout);
+        let (write_eof, write_eof_rx) = Registry::new(SERVER_EOF_TIMEOUT);
 
         Arc::new(Self {
             #[cfg(test)]
@@ -207,7 +211,7 @@ impl AnyTlsSession {
         let (reader, writer) = tokio::io::split(conn);
         // Use bounded channel for outgoing data to provide backpressure
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
-        let (write_eof, write_eof_rx) = Registry::new(WriteEofOptions::default().eof_timeout);
+        let (write_eof, write_eof_rx) = Registry::new(SERVER_EOF_TIMEOUT);
 
         // Create a "block all" proxy selector - tests that need real routing should
         // use the full constructor with proper dependencies
@@ -284,6 +288,16 @@ impl AnyTlsSession {
 
     /// Close the session
     pub async fn close(&self) {
+        self.close_within(WRITER_SHUTDOWN_TIMEOUT).await;
+    }
+
+    /// Close a session that has already failed. Its peer may have stopped
+    /// reading, so the writer may shut down cleanly only if it can do so at once.
+    async fn close_failed(&self) {
+        self.close_within(Duration::ZERO).await;
+    }
+
+    async fn close_within(&self, writer_bound: Duration) {
         if self
             .is_closed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
@@ -308,9 +322,10 @@ impl AnyTlsSession {
             streams.clear();
 
             // Try to shutdown writer gracefully, bounded so a peer that stops
-            // reading cannot hold the closing session open.
+            // reading cannot hold the closing session open. A timeout polls its
+            // future before its timer, so a zero bound still attempts it.
             if let Ok(mut writer) = self.writer.try_lock() {
-                let _ = tokio::time::timeout(WRITER_SHUTDOWN_TIMEOUT, writer.shutdown()).await;
+                let _ = tokio::time::timeout(writer_bound, writer.shutdown()).await;
             }
         }
     }
@@ -381,7 +396,11 @@ impl AnyTlsSession {
 
         // Cleanup
         session.transport_watch.lock().unwrap().take();
-        session.close().await;
+        if result.is_err() {
+            session.close_failed().await;
+        } else {
+            session.close().await;
+        }
 
         result
     }
@@ -987,7 +1006,7 @@ impl AnyTlsSession {
                     "Control frame write timed out after {:?}, closing session",
                     CONTROL_FRAME_TIMEOUT
                 );
-                self.close().await;
+                self.close_failed().await;
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "control frame write timed out",
@@ -1306,6 +1325,91 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
             assert!(session.is_closed());
         }
+    }
+
+    /// A transport whose peer stopped reading: its shutdown never completes.
+    struct ShutdownStalls {
+        inner: tokio::io::DuplexStream,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for ShutdownStalls {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ShutdownStalls {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_attempts_clean_close_without_waiting() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (inner, mut peer) = duplex(8192);
+        let transport = ShutdownStalls {
+            inner,
+            attempts: Arc::clone(&attempts),
+        };
+        let session = AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+        session.write_eof_agreed.store(true, Ordering::SeqCst);
+        peer.write_all(b"\x02\0\0").await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        let error = timeout(Duration::from_secs(1), session.run())
+            .await
+            .expect("a failed session must not wait for its writer")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(session.is_closed());
+        assert!(attempts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn clean_session_end_keeps_its_bounded_writer_shutdown() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (inner, mut peer) = duplex(8192);
+        let transport = ShutdownStalls {
+            inner,
+            attempts: Arc::clone(&attempts),
+        };
+        let session = AnyTlsSession::new_server_test(transport, PaddingFactory::default_factory());
+        peer.shutdown().await.unwrap();
+
+        let started = std::time::Instant::now();
+        timeout(WRITER_SHUTDOWN_TIMEOUT * 2, session.run())
+            .await
+            .expect("the writer shutdown stays bounded")
+            .unwrap();
+
+        assert!(started.elapsed() >= WRITER_SHUTDOWN_TIMEOUT - Duration::from_millis(100));
+        assert!(attempts.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]

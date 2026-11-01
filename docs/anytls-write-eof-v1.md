@@ -145,6 +145,12 @@ closure distinctly. Zero-length application writes are not an EOF signal.
   stays connected, unless it stays unreachable until the kernel's probe count
   runs out. An idle session is never probed. This is the only added wire
   traffic, and it carries no AnyTLS frames.
+- Failed sessions (Shoes): a session that has failed may have a peer that
+  stopped reading, so its writer shuts down cleanly only if it can do so at
+  once. A session that ended without failure keeps the 5 s graceful bound. The
+  server's own EOF deadline is the narrower 4.5 s, so a stalled EOF's failure
+  and the release of the session it held both fit inside the 5 s settlement
+  bound.
 - Where the watch exists: on Unix only (elsewhere it never fires), and only
   on Shoes' own TCP and Unix listeners, not the QUIC listener. Every
   connection they accept duplicates its socket descriptor while its protocol

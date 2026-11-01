@@ -480,7 +480,7 @@ async fn transport_eof_drain_case(case: DrainCase) {
                 _ => unreachable!(),
             };
             assert_eq!(result.unwrap_err().kind(), expected);
-            assert!(started.elapsed() < if case == DrainCase::Stalled { Duration::from_secs(6) } else { Duration::from_secs(1) });
+            assert!(started.elapsed() < if case == DrainCase::Stalled { Duration::from_secs(5) } else { Duration::from_secs(1) });
             eprintln!("interop regression case={case:?} explicit_failure={expected:?} bounded=true");
         } else { result.unwrap(); }
         target.await.unwrap();
