@@ -134,9 +134,17 @@ closure distinctly. Zero-length application writes are not an EOF signal.
   whole session on it: handler future error, registry cleared, relay handlers
   and destination sockets aborted, handler slots returned. A FIN is not an
   error, so healthy half-close and backpressure are unchanged; no read-ahead,
-  queue, deadline or wire traffic is added. This applies to legacy and
-  negotiated sessions alike, and a reset discards accepted data still queued
-  in the kernel.
+  queue or deadline is added. This applies to legacy and negotiated sessions
+  alike, and a reset discards accepted data still queued in the kernel.
+- Lost resets: a reset can fail to take effect, and a parked session sends
+  nothing, so its socket would stay established with a peer that is gone. Once
+  one frame has held the reader for 1 s, a watched session enables TCP
+  keepalive on the transport (1 s idle, 5 s interval) until that frame
+  completes, then restores the previous settings. A vanished peer answers the
+  probe with a fresh reset, which the watch reports. A live peer answers it and
+  stays connected, unless it stays unreachable until the kernel's probe count
+  runs out. An idle session is never probed. This is the only added wire
+  traffic, and it carries no AnyTLS frames.
 - Where the watch exists: on Unix only (elsewhere it never fires), and only
   on Shoes' own TCP and Unix listeners, not the QUIC listener. Every
   connection they accept duplicates its socket descriptor while its protocol

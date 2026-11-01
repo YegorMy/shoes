@@ -100,19 +100,87 @@ impl TransportWatch {
     /// Resolves once the OS reports an error on the socket (for example a
     /// reset), without reading it. Never resolves for a healthy socket, a
     /// peer's FIN, or when the error cannot be observed.
-    pub(crate) async fn failed(self) {
+    pub(crate) async fn failed(&self) {
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
             use tokio::io::Interest;
             use tokio::io::unix::AsyncFd;
             // Never read SO_ERROR here: it belongs to the socket, and taking it
             // would turn the session reader's reset into a clean EOF.
-            if let Ok(fd) = AsyncFd::with_interest(self.fd, Interest::ERROR)
+            if let Ok(fd) = AsyncFd::with_interest(self.fd.as_fd(), Interest::ERROR)
                 && fd.ready(Interest::ERROR).await.is_ok()
             {
                 return;
             }
         }
         std::future::pending().await
+    }
+
+    /// Probes the peer until the returned guard drops, then restores the socket.
+    ///
+    /// A reset can be lost, and a session parked on backpressure sends nothing,
+    /// so its socket would stay established with a peer that is gone. A probe
+    /// to a vanished peer draws a fresh reset, which [`Self::failed`] reports. A
+    /// live peer answers probes and is unaffected. Only for a stuck session:
+    /// an idle session must not wake its peer.
+    pub(crate) fn probe_while_stuck(&self) -> Option<StuckProbes<'_>> {
+        #[cfg(unix)]
+        {
+            let socket = socket2::SockRef::from(&self.fd);
+            let probes = StuckProbes {
+                enabled: socket.keepalive().ok()?,
+                time: socket.tcp_keepalive_time().ok()?,
+                interval: socket.tcp_keepalive_interval().ok()?,
+                socket,
+            };
+            // Keepalive first: setting the idle time then re-arms a running timer.
+            probes.socket.set_keepalive(true).ok()?;
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(STUCK_PROBE_IDLE)
+                .with_interval(STUCK_PROBE_INTERVAL);
+            probes.socket.set_tcp_keepalive(&keepalive).ok()?;
+            Some(probes)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
+/// Idle time before the first probe of a stuck session.
+#[cfg(unix)]
+const STUCK_PROBE_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Spacing of later probes, wide enough that a brief network loss on a live
+/// peer does not exhaust the kernel's probe count.
+#[cfg(unix)]
+const STUCK_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Active probing of a stuck session; dropping it restores the previous settings.
+pub(crate) struct StuckProbes<'a> {
+    #[cfg(unix)]
+    socket: socket2::SockRef<'a>,
+    #[cfg(unix)]
+    enabled: bool,
+    #[cfg(unix)]
+    time: std::time::Duration,
+    #[cfg(unix)]
+    interval: std::time::Duration,
+    #[cfg(not(unix))]
+    _socket: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for StuckProbes<'_> {
+    fn drop(&mut self) {
+        // Failure here means the socket is already gone; nothing is left to restore.
+        #[cfg(unix)]
+        {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(self.time)
+                .with_interval(self.interval);
+            let _ = self.socket.set_tcp_keepalive(&keepalive);
+            let _ = self.socket.set_keepalive(self.enabled);
+        }
     }
 }

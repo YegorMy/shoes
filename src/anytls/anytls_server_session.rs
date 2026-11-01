@@ -43,6 +43,9 @@ const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound on the graceful writer shutdown when a session closes.
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long one frame may hold the reader before the transport is probed.
+const STUCK_BEFORE_PROBING: Duration = Duration::from_secs(1);
+
 fn transport_failure() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionReset, "AnyTLS transport failed")
 }
@@ -72,7 +75,7 @@ pub struct AnyTlsSession {
     write_eof_tasks: Mutex<HashMap<tokio::task::Id, JoinHandle<()>>>,
     /// Error readiness of the accepted socket. A reader parked on stream
     /// delivery does not read the transport, so a reset is only seen here.
-    transport_watch: std::sync::Mutex<Option<TransportWatch>>,
+    transport_watch: std::sync::Mutex<Option<Arc<TransportWatch>>>,
     /// Underlying connection (split into reader/writer)
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -259,7 +262,7 @@ impl AnyTlsSession {
     /// Set before run. Without a watch, a transport failure is only seen once
     /// the reader reaches it.
     pub(super) fn watch_transport(&self, watch: Option<TransportWatch>) {
-        *self.transport_watch.lock().unwrap() = watch;
+        *self.transport_watch.lock().unwrap() = watch.map(Arc::new);
     }
 
     #[cfg(test)]
@@ -332,8 +335,9 @@ impl AnyTlsSession {
         cancel: Option<CancellationToken>,
     ) -> io::Result<()> {
         let session = Arc::clone(self);
-        // Held here, so the duplicate socket closes when the session returns.
-        let watch = session.transport_watch.lock().unwrap().take();
+        // Held here and cleared below, so the duplicate socket closes when the
+        // session returns.
+        let watch = session.transport_watch.lock().unwrap().clone();
         let transport_failed = async move {
             match watch {
                 Some(watch) => watch.failed().await,
@@ -376,9 +380,26 @@ impl AnyTlsSession {
         };
 
         // Cleanup
+        session.transport_watch.lock().unwrap().take();
         session.close().await;
 
         result
+    }
+
+    /// Handles one frame. If it holds the reader, the session has stopped
+    /// reading its transport, so probe the peer until the frame completes.
+    async fn handle_frame_probing_if_stuck(self: &Arc<Self>, frame: Frame) -> io::Result<()> {
+        let handling = self.handle_frame(frame);
+        tokio::pin!(handling);
+        // Biased, and a timer only registers when the frame is not ready at once.
+        tokio::select! {
+            biased;
+            result = &mut handling => return result,
+            () = tokio::time::sleep(STUCK_BEFORE_PROBING) => {}
+        }
+        let watch = self.transport_watch.lock().unwrap().clone();
+        let _probes = watch.as_ref().and_then(|watch| watch.probe_while_stuck());
+        handling.await
     }
 
     async fn settle_write_eof_relays(&self) -> io::Result<()> {
@@ -473,7 +494,7 @@ impl AnyTlsSession {
 
             // Decode and process any frames already in buffer (from initial data)
             while let Some(frame) = FrameCodec::decode(&mut buffer)? {
-                if let Err(e) = self.handle_frame(frame).await {
+                if let Err(e) = self.handle_frame_probing_if_stuck(frame).await {
                     log::warn!("Error handling frame (kind={:?})", e.kind());
                     return Err(e);
                 }

@@ -513,6 +513,86 @@ async fn backpressured_reset_releases_session_resources() {
     .unwrap();
 }
 
+/// Probes run only while the reader is parked: an idle session must not wake
+/// its peer, and a session that moves again must stop probing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_is_probed_only_while_session_is_stuck() {
+    timeout(Duration::from_secs(90), async {
+        let tls = tls();
+        let listener = small_listener();
+        let server_addr = listener.local_addr().unwrap();
+        let (observed, observed_rx) = tokio::sync::oneshot::channel::<OwnedFd>();
+        let grants = Arc::new(Grants::default());
+        let handler = negotiated_handler(&tls, &grants);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            observed
+                .send(tcp.as_fd().try_clone_to_owned().unwrap())
+                .unwrap();
+            process_stream(tcp, handler, Arc::new(NativeResolver))
+                .await
+                .unwrap();
+        });
+        let (target, accepted) = sink();
+        let client = strict_client(&tls, server_addr).await;
+        let observer = observed_rx.await.unwrap();
+        let probing = || socket2::SockRef::from(&observer).keepalive().unwrap();
+        let idle_before = probing();
+
+        // Idle past the stuck threshold: no probes, and none at all on open.
+        let stream = client.open_stream(location(target)).await.unwrap();
+        let mut destination = accepted.await.unwrap();
+        sleep(Duration::from_millis(2500)).await;
+        assert_eq!(probing(), idle_before, "an idle session was probed");
+        assert!(
+            !idle_before,
+            "this listener path sets no keepalive of its own"
+        );
+
+        // Parked: probes start, and a live peer survives them.
+        let upload = upload(stream, UPLOAD);
+        backpressured(&upload, UPLOAD).await;
+        timeout(BOUND, async {
+            while !probing() {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a stuck session was not probed");
+        sleep(Duration::from_secs(3)).await;
+        assert!(!upload.task.is_finished(), "probes ended a live upload");
+        assert!(!grants.done.is_cancelled(), "probes settled a live session");
+
+        // Moving again: probes stop and the previous setting returns.
+        let drain = tokio::spawn(async move {
+            let mut drained = vec![0; 1 << 20];
+            loop {
+                match destination.read(&mut drained).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        timeout(Duration::from_secs(30), upload.task)
+            .await
+            .expect("upload did not finish after the destination drained")
+            .unwrap()
+            .unwrap();
+        timeout(BOUND, async {
+            while probing() {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a session that moved again kept probing");
+        drop(client);
+        drain.abort();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backpressured_healthy_session_is_not_settled() {
     timeout(Duration::from_secs(90), async {
